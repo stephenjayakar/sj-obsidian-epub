@@ -38,6 +38,7 @@ export interface EpubBook {
 	opfDir: string;
 	cssCache: Record<string, string>;  // manifest-relative href → css text
 	citations: Record<number, EpubCitation>;  // citation number → text + navigable target
+	spineSizes: number[];  // raw HTML length of each spine item (0 if missing) — sizes ToC-less sections
 	zip: JSZip;  // the book's backing archive — every raw read goes through it
 }
 
@@ -219,27 +220,39 @@ async function parseWithFS(fs: EpubFS): Promise<Omit<EpubBook, "zip">> {
 	);
 
 	// 6. Pre-scan spine items for bibliography-style citations (e.g. "[78] Author...")
-	const citations = await parseCitationsFromSpine(fs, opfDir, spine);
+	const { citations, spineSizes } = await scanSpine(fs, opfDir, spine);
 
-	return { title, spine, manifest, toc, imageMap, blobUrls, opfDir, cssCache, citations };
+	return { title, spine, manifest, toc, imageMap, blobUrls, opfDir, cssCache, citations, spineSizes };
 }
 
 /** Walk every spine item looking for paragraphs whose text begins with "[N] ".
  *  These are taken as bibliography entries — the most common epub convention
  *  for end-of-book endnotes/references (and what the Naval Almanack uses via
  *  the Scribe publishing platform). Stored once at book-load so [N] markers
- *  anywhere in the body text can resolve to their full citation. */
-async function parseCitationsFromSpine(fs: EpubFS, opfDir: string, spine: EpubManifestItem[]): Promise<Record<number, EpubCitation>> {
+ *  anywhere in the body text can resolve to their full citation.
+ *
+ *  Also records each item's raw size, since this is the one pass that reads
+ *  every item anyway. Reads run in parallel — scanned/OCR epubs ship one file
+ *  per printed page (1,700+ items), where serial awaits cost seconds. */
+async function scanSpine(
+	fs: EpubFS,
+	opfDir: string,
+	spine: EpubManifestItem[],
+): Promise<{ citations: Record<number, EpubCitation>; spineSizes: number[] }> {
 	const citations: Record<number, EpubCitation> = {};
 	const re = /^\s*\[(\d+)\]\s+\S/;
-	// Process spine in order so the first occurrence of each citation wins.
-	for (const item of spine) {
+	const htmls = await Promise.all(spine.map(async (item) => {
 		const path = opfDir + item.href;
-		if (!await fs.exists(path)) continue;
-		let html: string;
-		try { html = await fs.readString(path); } catch { continue; }
+		if (!await fs.exists(path)) return null;
+		try { return await fs.readString(path); } catch { return null; }
+	}));
+	const spineSizes = htmls.map((html) => html?.length ?? 0);
+	// Process spine in order so the first occurrence of each citation wins.
+	spine.forEach((item, i) => {
+		const html = htmls[i];
+		if (html === null) return;
 		// Cheap pre-filter: only parse if the file contains anything resembling a citation
-		if (!/\[\d+\]/.test(html)) continue;
+		if (!/\[\d+\]/.test(html)) return;
 		const doc = new DOMParser().parseFromString(html, 'text/html');
 		doc.querySelectorAll('p, li, div').forEach(el => {
 			// Skip elements that contain block children — we want leaf paragraphs only
@@ -254,8 +267,8 @@ async function parseCitationsFromSpine(fs: EpubFS, opfDir: string, spine: EpubMa
 				citations[n] = { text, href: `${item.href}#tmr-cite-${n}` };
 			}
 		});
-	}
-	return citations;
+	});
+	return { citations, spineSizes };
 }
 
 /** Add id="tmr-cite-N" to bibliography paragraphs so citation links can
@@ -370,6 +383,9 @@ export function expandSelfClosingTags(html: string): string {
 	);
 }
 
+/** Main-thread work allowed between frame yields in long render/measure loops. */
+export const YIELD_BUDGET_MS = 12;
+
 export async function renderSpineRange(
 	book: EpubBook,
 	startSpine: number,
@@ -382,6 +398,7 @@ export async function renderSpineRange(
 	const end = Math.min(endSpine, book.spine.length - 1);
 	if (start > end) return;
 
+	let lastYield = performance.now();
 	for (let i = start; i <= end; i++) {
 		const item = book.spine[i];
 		const wrapper = createDiv();
@@ -455,8 +472,13 @@ export async function renderSpineRange(
 		// Wrap [N] citation markers in body text with hoverable .tmr-citation spans
 		wrapCitations(wrapper, book.citations);
 
-		// Yield to the browser so Obsidian stays responsive
-		await new Promise<void>(r => window.requestAnimationFrame(() => r()));
+		// Yield to the browser so Obsidian stays responsive. Time-sliced rather
+		// than per item: a range of many tiny items (one-page-per-file scans)
+		// would otherwise cost a full frame each.
+		if (performance.now() - lastYield > YIELD_BUDGET_MS) {
+			await new Promise<void>(r => window.requestAnimationFrame(() => r()));
+			lastYield = performance.now();
+		}
 	}
 }
 

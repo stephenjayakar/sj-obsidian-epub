@@ -41,6 +41,7 @@ import {
 	EpubBook,
 	EpubDrmError,
 	EpubTocItem,
+	YIELD_BUDGET_MS,
 	packEpubFolder,
 	type EpubLinkPreview,
 	type EpubPackFs,
@@ -103,6 +104,10 @@ export const READER_VIEW_TYPE = "third-mind-reader";
 const SEARCH_MIN_CHARS = 2;
 const SEARCH_MAX_HITS = 500;
 const SEARCH_RENDER_CAP = 100;
+// ToC-less books: items at least this large are treated as real chapters and
+// get their own section; smaller ones are merged up to the target size.
+const FALLBACK_SECTION_SMALL_ITEM_BYTES = 16_000;
+const FALLBACK_SECTION_TARGET_BYTES = 80_000;
 
 interface ImportEntry {
 	/** Book root as it appears in `webkitRelativePath`, e.g. `Books/Zen.epub`. */
@@ -2303,8 +2308,23 @@ export class ReaderView extends ItemView {
 		}
 
 		if (rawSections.length === 0) {
+			// No usable ToC. Real chapters stay one section each, but runs of tiny
+			// items are merged: scanned/OCR epubs ship one file per printed page
+			// (1,700+ for a Bible), and a section per page means a measurement
+			// pass per page before the book can open, plus mid-sentence breaks.
+			const sizes = this.book.spineSizes;
+			let runBytes = 0;
 			for (let i = 0; i < this.book.spine.length; i++) {
-				rawSections.push({ label: `Section ${i + 1}`, href: this.book.spine[i].href, startSpine: i });
+				const size = sizes[i] ?? 0;
+				const startsNew = rawSections.length === 0
+					|| size >= FALLBACK_SECTION_SMALL_ITEM_BYTES
+					|| (runBytes >= FALLBACK_SECTION_SMALL_ITEM_BYTES && runBytes + size > FALLBACK_SECTION_TARGET_BYTES)
+					|| runBytes >= FALLBACK_SECTION_TARGET_BYTES;
+				if (startsNew) {
+					rawSections.push({ label: `Section ${rawSections.length + 1}`, href: this.book.spine[i].href, startSpine: i });
+					runBytes = 0;
+				}
+				runBytes += size;
 			}
 		}
 
@@ -2491,6 +2511,7 @@ export class ReaderView extends ItemView {
 		this.unitStartSpreads = [];
 		this.totalSpreads = 0;
 
+		let lastYield = performance.now();
 		for (let i = 0; i < this.sections.length; i++) {
 			// Superseded by a newer queued pass: stop burning frames on a model
 			// that will be rebuilt immediately after. Caller handles the bail.
@@ -2499,8 +2520,13 @@ export class ReaderView extends ItemView {
 			this.sectionSpreadCounts[i] = measured.spreads;
 			this.sectionColumnCounts[i] = measured.columns;
 			// Yield a frame only when real measurement work happened — a cache-hit
-			// rebuild (returning to a known pane size) runs without pacing.
-			if (!measured.fromCache) await new Promise<void>((r) => window.requestAnimationFrame(() => r()));
+			// rebuild (returning to a known pane size) runs without pacing — and
+			// only once the slice budget is spent, so books with many short
+			// sections don't pay a frame apiece.
+			if (!measured.fromCache && performance.now() - lastYield > YIELD_BUDGET_MS) {
+				await new Promise<void>((r) => window.requestAnimationFrame(() => r()));
+				lastYield = performance.now();
+			}
 		}
 
 		for (let i = 0; i < this.sections.length; i++) {
@@ -5037,11 +5063,15 @@ export class ReaderView extends ItemView {
 	}
 
 	private showError(msg: string): void {
-		const loading = this.contentEl.querySelector(".tmr-loading");
-		if (loading) {
-			loading.setText(msg);
-			loading.addClass("tmr-error");
+		// The placeholder is removed before layout starts, so a failure past
+		// that point would otherwise leave a silent blank pane.
+		let loading = this.contentEl.querySelector(".tmr-loading");
+		if (!loading) {
+			this.spreadEl?.addClass("tmr-hidden");
+			loading = this.contentEl.createDiv({ cls: "tmr-loading" });
 		}
+		loading.setText(msg);
+		loading.addClass("tmr-error");
 	}
 
 	/** Pop-out windows are unsupported: the reader's listeners and floaters all
