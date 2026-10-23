@@ -725,6 +725,32 @@ body.is-mobile .tmr-root.tmr-kbd-frozen .tmr-spread {
 	widows: 2;
 }
 
+/* Justify (justify.ts). Paragraphs it sets carry `.tmr-kp`: every line ends in
+   a `.tmr-kp-br` whose generated newline forces the break, and the line's
+   spacing is already in its `.tmr-kp-gap` spans, so the browser must neither
+   wrap nor stretch anything itself. `nowrap` turns a sub-pixel measuring
+   error into an invisible overhang instead of a stray extra line. Generated
+   content stays out of selections and copied text. Paragraphs it declines
+   (drop caps, inline images, centred text) fall back to CSS justification. */
+.tmr-justify .tmr-content p:not(.tmr-kp) {
+	text-align: justify;
+	hyphens: auto;
+}
+
+.tmr-content p.tmr-kp {
+	white-space: nowrap;
+	hyphens: manual;
+}
+
+.tmr-kp-br::before {
+	content: "\A";
+	white-space: pre;
+}
+
+.tmr-kp-hy::before {
+	content: "-\A";
+}
+
 .tmr-content p.tmr-drop-cap::first-letter {
 	/* WebKit shipped this prefixed for years before adopting the standard name,
 	   and Blink only ever had the standard one (verified: this Chromium supports

@@ -26,6 +26,7 @@
   "dependencies": {
     "@chenglou/pretext": "^0.0.9",
     "dompurify": "^3.4.15",
+    "hyphen": "^1.14.1",
     "jszip": "^3.10.1"
   }
 }

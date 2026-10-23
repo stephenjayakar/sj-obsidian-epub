@@ -47,6 +47,7 @@ import {
 	type EpubPackFs,
 } from "./epub";
 import { OffsetMap, type CursorRange, isRegisterableBlock, REGISTERABLE_BLOCK_SELECTOR } from "./pretext-layer";
+import { justifyParagraphs, clearJustification } from "./justify";
 import { isLocalEndpoint, probeProvider, starterModel, type AiProvider, type ProviderKind, type LocalRuntime } from "./ai-client";
 import { findFlaggedDocs, processPendingInFile } from "./ai-queue";
 import { LibraryView, LIBRARY_VIEW_TYPE } from "./library-view";
@@ -197,6 +198,9 @@ interface ThirdMindReaderSettings {
 	/** How the neighbouring pages that bleed into the side margins are drawn.
 	 *  Desktop only: touch layouts always clip them. */
 	readerAdjacentPages: "default" | "muted" | "hidden";
+	/** Set body paragraphs justified with Knuth-Plass line breaking and
+	 *  hyphenation (justify.ts) instead of ragged right. */
+	readerJustify: boolean;
 }
 
 /** `family: null` is the reader's own default: Labrada in 3C mode, Obsidian's
@@ -268,6 +272,7 @@ const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	readerLineWidth: null,
 	readerMargins: null,
 	readerAdjacentPages: "default",
+	readerJustify: false,
 };
 
 /** Bounds of the reader text-size override. Wider than Obsidian's own slider at
@@ -1266,6 +1271,7 @@ export class ReaderView extends ItemView {
 		const adjacent = this.plugin.settings.readerAdjacentPages;
 		this.contentEl.toggleClass("tmr-adjacent-muted", adjacent === "muted");
 		this.contentEl.toggleClass("tmr-adjacent-hidden", adjacent === "hidden");
+		this.contentEl.toggleClass("tmr-justify", this.plugin.settings.readerJustify);
 		const signature = this.appearanceSignature();
 		if (signature === this.appliedAppearance) return;
 		const first = this.appliedAppearance === "";
@@ -1287,6 +1293,7 @@ export class ReaderView extends ItemView {
 			s.readerParagraphSpacing,
 			s.readerLineWidth,
 			s.readerMargins,
+			s.readerJustify,
 		].join("|");
 	}
 
@@ -2487,6 +2494,13 @@ export class ReaderView extends ItemView {
 		this.annotateItalicBlocks(this.measurementContentEl);
 		this.syncSpreadLayoutMode(this.measurementSpreadEl);
 		const { innerWidth, colWidth, gap } = this.applyPagination(this.measurementSpreadEl, this.measurementContentEl);
+		if (this.plugin.settings.readerJustify) {
+			// Line breaks are computed from canvas metrics, so the faces this
+			// section's first layout just requested have to be in before measuring.
+			void this.measurementContentEl.offsetHeight;
+			await document.fonts.ready;
+			this.syncJustification(this.measurementContentEl);
+		}
 		const spreads = this.getSpreadCountForContent(this.measurementContentEl, innerWidth, gap);
 		// Column count only gates pairing/singlePage, which test `=== 1`; a
 		// multi-spread section can't be single-column, so skip its ink probe.
@@ -2674,6 +2688,11 @@ export class ReaderView extends ItemView {
 			this.mountedUnitKeys.next = "";
 		}
 
+		// The neighbours bleed into the margins, so their lines must break the
+		// same way they will once turned to.
+		this.syncJustification(this.prevHost);
+		this.syncJustification(this.nextHost);
+
 		const currentUnit = this.units[this.currentUnitIndex];
 		const keep = new Set(
 			[currentUnit, this.units[prevIdx], this.units[nextIdx]]
@@ -2824,12 +2843,7 @@ export class ReaderView extends ItemView {
 	private applyContentLayout(unit: RenderUnit): void {
 		if (!this.contentNode) return;
 		this.syncSpreadLayoutMode(this.spreadEl);
-		if (this.layoutMode === "single") {
-			this.contentNode.removeClass("tmr-single-page");
-			this.paginateVisibleContent();
-			return;
-		}
-		if (unit.singlePage) {
+		if (this.layoutMode !== "single" && unit.singlePage) {
 			// Clear inline column styles so the CSS class takes over
 			this.contentNode.style.removeProperty("column-width");
 			this.contentNode.style.removeProperty("column-gap");
@@ -2837,6 +2851,22 @@ export class ReaderView extends ItemView {
 		} else {
 			this.contentNode.removeClass("tmr-single-page");
 			this.paginateVisibleContent();
+		}
+		// After the columns are sized: justified breaks are set to the width the
+		// paragraphs actually get, which the cached unit DOM may not have had.
+		this.syncJustification(this.contentNode);
+	}
+
+	/** Bring a mounted unit's paragraphs in line with the Justify setting —
+	 *  justified to their current width, or back to the browser's own breaks.
+	 *  Both directions are no-ops when there is nothing to change. */
+	private syncJustification(root: HTMLElement | null): void {
+		if (!root) return;
+		if (this.plugin.settings.readerJustify) {
+			const lang = this.book?.language ?? "";
+			justifyParagraphs(root, { hyphenate: lang === "" || lang.startsWith("en") });
+		} else {
+			clearJustification(root);
 		}
 	}
 
@@ -5908,6 +5938,11 @@ class TmrSettingTab extends PluginSettingTab {
 							format: (n) => n.toFixed(1),
 							sampleVar: ["--tmr-para-spacing", "em"],
 						}),
+						{
+							name: "Justify text",
+							desc: "Set paragraphs flush to both margins, choosing line breaks across the whole paragraph (Knuth-Plass) and hyphenating English words, for even spacing without rivers.",
+							control: { type: "toggle", key: "readerJustify" },
+						},
 					],
 				},
 				{
@@ -6060,6 +6095,7 @@ class TmrSettingTab extends PluginSettingTab {
 		settings.readerLineWidth = DEFAULT_SETTINGS.readerLineWidth;
 		settings.readerMargins = DEFAULT_SETTINGS.readerMargins;
 		settings.readerAdjacentPages = DEFAULT_SETTINGS.readerAdjacentPages;
+		settings.readerJustify = DEFAULT_SETTINGS.readerJustify;
 		await this.plugin.saveSettings();
 		this.update();
 	}
@@ -6125,6 +6161,7 @@ class TmrSettingTab extends PluginSettingTab {
 			case "followAppTextSize": return settings.readerFontSize === null;
 			case "readerFont": return settings.readerFont;
 			case "readerAdjacentPages": return settings.readerAdjacentPages;
+			case "readerJustify": return settings.readerJustify;
 			case "quickHighlight": return settings.quickHighlight[Platform.isMobile ? "mobile" : "desktop"];
 			case "primaryProviderId": return settings.aiDefaults.primaryProviderId ?? "";
 			case "aiFeaturesEnabled":
@@ -6150,6 +6187,9 @@ class TmrSettingTab extends PluginSettingTab {
 				break;
 			case "readerAdjacentPages":
 				settings.readerAdjacentPages = value === "muted" || value === "hidden" ? value : "default";
+				break;
+			case "readerJustify":
+				settings.readerJustify = value === true;
 				break;
 			case "quickHighlight":
 				settings.quickHighlight[Platform.isMobile ? "mobile" : "desktop"] = value === true;
