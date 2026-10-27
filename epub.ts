@@ -56,6 +56,12 @@ const NOTEISH_PATH_RE = /(note|footnote|endnote|gloss|appendix|backmatter|refere
 const NOTEISH_ATTR_RE = /\b(footnote|endnote|gloss|glossary|glossdef|note|fn\d*|rfn\d*)\b/i;
 const NOTEISH_MARKER_RE = /^(?:\d+|[*†‡§¶])(?:[.)]|\s)\s*\S/;
 
+/** Forget the parsed documents link previews were read from — rebuilt on the
+ *  next hover. */
+export function clearPreviewCache(book: EpubBook): void {
+	previewDocCache.delete(book);
+}
+
 export function revokeImageUrls(book: EpubBook): void {
 	book.blobUrls.forEach((url) => URL.revokeObjectURL(url));
 	book.blobUrls = [];

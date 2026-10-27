@@ -452,19 +452,30 @@ function optimalBreaks(para: Paragraph, cands: Candidate[], shrinkLimit: number)
 // at the same width. Replaying a plan skips the walk, the canvas measuring
 // and the line breaker, which were most of the cost of a justified chapter.
 
-interface PlanBreak { at: number; hyphen: boolean }
-interface PlanSpan { start: number; end: number; spacing: number }
-interface Plan { breaks: PlanBreak[]; spans: PlanSpan[] }
+/** Flat number arrays rather than an object per break and per span: a whole
+ *  book's plans stay resident (the measurement pass sets every paragraph),
+ *  and per-line objects made that tens of megabytes on a Bible.
+ *  `breaks`: `at * 2 + (hyphen ? 1 : 0)`. `spans`: `start, end, spacing` triples. */
+interface Plan { breaks: number[]; spans: number[] }
 
-interface CacheEntry { text: string; plan: Plan | null }
+/** `sig` hashes the paragraph's text and inline structure, guarding the
+ *  ordinal key against a different render without keeping the text itself. */
+interface CacheEntry { sig: number; plan: Plan | null }
 
-/** Paragraph plans per book, keyed by `${spine}:${ordinal}|${geometry key}`.
- *  The stored text guards the ordinal key against a different render. */
-const planCaches = new Map<string, Map<string, CacheEntry>>();
+interface ScopeCache {
+	/** geometry key → (spine * SLOT_SPAN + ordinal) → entry */
+	byGeometry: Map<string, Map<number, CacheEntry>>;
+	size: number;
+}
+
+/** Paragraph plans per book (scope), then per geometry. */
+const planCaches = new Map<string, ScopeCache>();
 const MAX_SCOPES = 3;
 const MAX_PLANS_PER_SCOPE = 60000;
+/** Paragraph ordinals per spine item in a slot key. */
+const SLOT_SPAN = 2 ** 20;
 
-function planCache(scope: string): Map<string, CacheEntry> {
+function planCache(scope: string): ScopeCache {
 	let cache = planCaches.get(scope);
 	if (cache) {
 		// Most recently used scope last, so the oldest is evicted first.
@@ -472,10 +483,25 @@ function planCache(scope: string): Map<string, CacheEntry> {
 		planCaches.set(scope, cache);
 		return cache;
 	}
-	cache = new Map();
+	cache = { byGeometry: new Map(), size: 0 };
 	planCaches.set(scope, cache);
 	while (planCaches.size > MAX_SCOPES) planCaches.delete(planCaches.keys().next().value as string);
 	return cache;
+}
+
+/** FNV-1a over the text, then the structure tag. */
+function paragraphSig(text: string, structure: string): number {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < text.length; i++) {
+		h ^= text.charCodeAt(i);
+		h = Math.imul(h, 0x01000193);
+	}
+	h ^= text.length;
+	for (let i = 0; i < structure.length; i++) {
+		h ^= structure.charCodeAt(i);
+		h = Math.imul(h, 0x01000193);
+	}
+	return h >>> 0;
 }
 
 /** Word-separator characters `word-spacing` also stretches, besides the
@@ -531,21 +557,21 @@ function buildPlan(para: Paragraph, cands: Candidate[], breaks: number[]): Plan 
 					? (b.kind === "space" ? b.gap!.start : lineEnd.offset)
 					: node.length;
 				if (start <= para.gaps[g].start && end >= para.gaps[last].end && !OTHER_WORD_SEPARATORS.test(node.data.slice(start, end))) {
-					plan.spans.push({ start: at(node, start), end: at(node, end), spacing: para.gaps[g].baseSpacing + extra });
+					plan.spans.push(at(node, start), at(node, end), para.gaps[g].baseSpacing + extra);
 				} else {
 					for (let k = g; k <= last; k++) {
 						const gap = para.gaps[k];
-						plan.spans.push({ start: at(gap.node, gap.start), end: at(gap.node, gap.end), spacing: gap.baseSpacing + extra });
+						plan.spans.push(at(gap.node, gap.start), at(gap.node, gap.end), gap.baseSpacing + extra);
 					}
 				}
 				g = last + 1;
 			}
 		}
 		if (b.kind === "space") {
-			plan.breaks.push({ at: at(b.gap!.node, b.gap!.end), hyphen: false });
+			plan.breaks.push(at(b.gap!.node, b.gap!.end) * 2);
 		} else if (b.kind === "hyphen") {
 			const wb = b.wordBreak!;
-			plan.breaks.push({ at: at(wb.node, wb.offset), hyphen: wb.hyphenWidth > 0 });
+			plan.breaks.push(at(wb.node, wb.offset) * 2 + (wb.hyphenWidth > 0 ? 1 : 0));
 		}
 		from = to;
 	}
@@ -575,20 +601,22 @@ function applyPlan(el: HTMLElement, plan: Plan, breaksOnly: boolean): void {
 	// Spans split per text node, in case this render's nodes fall differently
 	// from the one the plan was made on.
 	const ops: Array<Op & { node: number }> = [];
-	for (const b of plan.breaks) {
+	for (const code of plan.breaks) {
+		const at = code >> 1;
 		// A break belongs to the node it ends: the first whose end reaches it.
 		let i = 0;
-		while (i < nodes.length - 1 && starts[i] + nodes[i].length < b.at) i++;
-		ops.push({ kind: "break", at: b.at, hyphen: b.hyphen, node: i });
+		while (i < nodes.length - 1 && starts[i] + nodes[i].length < at) i++;
+		ops.push({ kind: "break", at, hyphen: (code & 1) === 1, node: i });
 	}
 	if (!breaksOnly) {
-		for (const s of plan.spans) {
+		const sp = plan.spans;
+		for (let k = 0; k < sp.length; k += 3) {
 			for (let i = 0; i < nodes.length; i++) {
 				const ns = starts[i];
 				const ne = ns + nodes[i].length;
-				const lo = Math.max(s.start, ns);
-				const hi = Math.min(s.end, ne);
-				if (hi > lo) ops.push({ kind: "gap", start: lo, end: hi, spacing: s.spacing, node: i });
+				const lo = Math.max(sp[k], ns);
+				const hi = Math.min(sp[k + 1], ne);
+				if (hi > lo) ops.push({ kind: "gap", start: lo, end: hi, spacing: sp[k + 2], node: i });
 			}
 		}
 	}
@@ -676,7 +704,7 @@ export function justifyParagraphs(root: HTMLElement, opts: JustifyRunOptions): v
 	// that, on every unit change.
 	if (!root.getClientRects().length) return;
 	const all = Array.from(root.querySelectorAll<HTMLElement>(".tmr-spine-item p"));
-	const jobs: Array<{ el: HTMLElement; width: number; indent: number; key: string; cacheKey: string }> = [];
+	const jobs: Array<{ el: HTMLElement; width: number; indent: number; key: string; geometry: string; slot: number; structure: string }> = [];
 	const ordinals = new Map<Element, number>();
 	for (const el of all) {
 		const item = el.closest<HTMLElement>(".tmr-spine-item");
@@ -701,7 +729,8 @@ export function justifyParagraphs(root: HTMLElement, opts: JustifyRunOptions): v
 		// with different inline markup: the measurement copy never has its
 		// source drop-cap wrappers flattened, the mounted unit does.
 		const structure = `${el.childElementCount}:${el.firstChild?.nodeName ?? ""}`;
-		jobs.push({ el, width, indent, key, cacheKey: `${item?.dataset.spineIndex ?? "?"}:${ordinal}|${structure}|${geometry}` });
+		const spine = parseInt(item?.dataset.spineIndex ?? "", 10);
+		jobs.push({ el, width, indent, key, geometry, structure, slot: Number.isFinite(spine) ? spine * SLOT_SPAN + ordinal : -1 });
 	}
 	if (!jobs.length) return;
 
@@ -714,19 +743,59 @@ export function justifyParagraphs(root: HTMLElement, opts: JustifyRunOptions): v
 		// Remember the attempt either way, so a paragraph that can't be set
 		// isn't re-walked on every mount at the same width.
 		job.el.dataset.kpKey = job.key;
-		const text = job.el.textContent ?? "";
-		let entry = cache?.get(job.cacheKey);
-		if (!entry || entry.text !== text) {
-			entry = { text, plan: computePlan(job.el, job.width, job.indent, styles, opts) };
-			if (cache) {
-				if (cache.size >= MAX_PLANS_PER_SCOPE) cache.clear();
-				cache.set(job.cacheKey, entry);
+		const sig = paragraphSig(job.el.textContent ?? "", job.structure);
+		let slots = cache && job.slot >= 0 ? cache.byGeometry.get(job.geometry) : undefined;
+		let entry = slots?.get(job.slot);
+		if (!entry || entry.sig !== sig) {
+			entry = { sig, plan: computePlan(job.el, job.width, job.indent, styles, opts) };
+			if (cache && job.slot >= 0) {
+				if (cache.size >= MAX_PLANS_PER_SCOPE) {
+					cache.byGeometry.clear();
+					cache.size = 0;
+					slots = undefined;
+				}
+				if (!slots) {
+					slots = new Map();
+					cache.byGeometry.set(job.geometry, slots);
+				}
+				if (!slots.has(job.slot)) cache.size++;
+				slots.set(job.slot, entry);
 			}
 		}
 		if (entry.plan) planned.push({ el: job.el, plan: entry.plan });
 	}
 
 	for (const { el, plan } of planned) applyPlan(el, plan, !!opts.breaksOnly);
+	releaseMeasureContext();
+}
+
+/** Drop the measuring canvas. Blink keeps the shaped result of every string
+ *  a canvas has measured for that canvas's lifetime — a whole book's words
+ *  and word-prefixes, tens of megabytes — and the widths are already cached
+ *  here, so a fresh canvas per pass costs nothing and lets that go. */
+function releaseMeasureContext(): void {
+	measureCtx = null;
+	measureFont = "";
+}
+
+/** Shed what a reader that isn't on screen doesn't need: the book's plans
+ *  outside `keepSpines` (the units it will remount first), and the shared
+ *  width and hyphenation caches, which refill on demand. */
+export function trimJustifyCaches(scope: string | undefined, keepSpines: Set<number>): void {
+	widthCache.clear();
+	hyphenCache.clear();
+	releaseMeasureContext();
+	const cache = scope !== undefined ? planCaches.get(scope) : undefined;
+	if (!cache) return;
+	let size = 0;
+	for (const [geometry, slots] of cache.byGeometry) {
+		for (const slot of Array.from(slots.keys())) {
+			if (!keepSpines.has(Math.floor(slot / SLOT_SPAN))) slots.delete(slot);
+		}
+		if (!slots.size) cache.byGeometry.delete(geometry);
+		size += slots.size;
+	}
+	cache.size = size;
 }
 
 /** Undo `justifyParagraphs` under `root`, restoring the original text nodes'

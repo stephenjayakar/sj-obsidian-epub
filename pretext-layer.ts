@@ -48,6 +48,7 @@ export class OffsetMap {
 	 *  happens on book load via `clear()`. */
 	prepareUnit(unitEl: HTMLElement, font: string = BODY_FONT): void {
 		const spineItems = Array.from(unitEl.querySelectorAll<HTMLElement>(".tmr-spine-item"));
+		let appended = false;
 		for (const spineItem of spineItems) {
 			const spineIndex = parseInt(spineItem.dataset.spineIndex ?? "0", 10);
 			// Body prose, list items, and leaf blockquotes are all annotatable.
@@ -107,11 +108,15 @@ export class OffsetMap {
 				// Re-preparing a unit (after cache eviction + re-render) overwrites
 				// the entry — that refreshes the live element reference — but must
 				// not append the paraId again or orderedIds grows every re-mount.
-				if (!this.entries.has(paraId)) this.orderedIds.push(paraId);
+				if (!this.entries.has(paraId)) {
+					this.orderedIds.push(paraId);
+					appended = true;
+				}
 				this.entries.set(paraId, entry);
 				paraCount++;
 			}
 		}
+		if (appended) this.sortOrderedIds();
 	}
 
 	/** Convert a DOM Selection to a CursorRange (for highlight creation).
@@ -304,6 +309,36 @@ export class OffsetMap {
 	clear(): void {
 		this.entries.clear();
 		this.orderedIds = [];
+	}
+
+	/** Forget the paragraphs of a unit that has been evicted from the DOM.
+	 *  Entries hold their live element, so without this every unit ever
+	 *  visited stayed in memory for as long as the book was open. Only
+	 *  entries still pointing into `unitEl` go: a re-render of the same unit
+	 *  elsewhere has already replaced them. */
+	dropUnit(unitEl: HTMLElement): void {
+		let dropped = false;
+		for (const el of Array.from(unitEl.querySelectorAll<HTMLElement>("[data-para-id]"))) {
+			const id = el.dataset.paraId;
+			if (id && this.entries.get(id)?.element === el) {
+				this.entries.delete(id);
+				dropped = true;
+			}
+		}
+		if (dropped) this.orderedIds = this.orderedIds.filter((id) => this.entries.has(id));
+	}
+
+	/** Keep `orderedIds` in reading order. Units are prepared current-first,
+	 *  then their neighbours, so appending alone put a previous unit's
+	 *  paragraphs after the current one's — and a highlight crossing that
+	 *  boundary then fell back to one spanning range. */
+	private sortOrderedIds(): void {
+		const key = (id: string): number => {
+			const m = /^s(\d+)-p(\d+)$/.exec(id);
+			return m ? parseInt(m[1], 10) * 1048576 + parseInt(m[2], 10) : Number.MAX_SAFE_INTEGER;
+		};
+		const keys = new Map(this.orderedIds.map((id) => [id, key(id)]));
+		this.orderedIds.sort((a, b) => keys.get(a)! - keys.get(b)!);
 	}
 }
 

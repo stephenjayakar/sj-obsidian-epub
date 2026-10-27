@@ -34,7 +34,7 @@ import {
 	parseEpub,
 	renderSpineRange,
 	expandSelfClosingTags,
-	revokeImageUrls,
+	revokeImageUrls, clearPreviewCache,
 	extractLinkPreview,
 	resolveEpubHref,
 	resolveRelativePath,
@@ -47,7 +47,7 @@ import {
 	type EpubPackFs,
 } from "./epub";
 import { OffsetMap, type CursorRange, isRegisterableBlock, REGISTERABLE_BLOCK_SELECTOR } from "./pretext-layer";
-import { justifyParagraphs, clearJustification } from "./justify";
+import { justifyParagraphs, clearJustification, trimJustifyCaches } from "./justify";
 import { isLocalEndpoint, probeProvider, starterModel, type AiProvider, type ProviderKind, type LocalRuntime } from "./ai-client";
 import { findFlaggedDocs, processPendingInFile } from "./ai-queue";
 import { LibraryView, LIBRARY_VIEW_TYPE } from "./library-view";
@@ -851,6 +851,21 @@ export class ReaderView extends ItemView {
 	private editingNoteIdx: number | null = null;
 
 	private positionSaveTimer: number | null = null;
+	/** Fires when the reader leaves or re-enters the screen: a background tab,
+	 *  a collapsed split, a minimised window. */
+	private visibilityObserver: IntersectionObserver | null = null;
+	private releaseTimer: number | null = null;
+	private deepReleaseTimer: number | null = null;
+	/** What has been let go while off screen. 0: nothing. 1: everything but the
+	 *  current unit's DOM, which is kept detached — already rendered and
+	 *  justified, so coming back is a re-attach and one layout. 2: that too, so
+	 *  coming back is a unit mount. The model (sections, units, spread counts,
+	 *  position) is always kept: never a reopen. */
+	private releaseLevel: 0 | 1 | 2 = 0;
+	/** How long a hidden tab keeps everything, so flicking between tabs costs
+	 *  nothing; and how long it keeps the current unit. */
+	private static readonly RELEASE_DELAY_MS = 10000;
+	private static readonly DEEP_RELEASE_DELAY_MS = 5 * 60 * 1000;
 
 	private static readonly GAP = 48;
 	private static readonly SINGLE_PAGE_HYSTERESIS = 32;
@@ -1010,6 +1025,9 @@ export class ReaderView extends ItemView {
 
 		this.renderShell();
 		this.registerEvent(this.app.workspace.on("layout-change", () => this.syncPopoutGuard()));
+		this.visibilityObserver = new IntersectionObserver(() => this.onVisibilityChange());
+		this.visibilityObserver.observe(this.contentEl);
+		this.registerDomEvent(this.contentEl.ownerDocument, "visibilitychange", () => this.onVisibilityChange());
 		this.syncPopoutGuard();
 
 		this.registerDomEvent(document, "mouseup", () => {
@@ -1170,6 +1188,9 @@ export class ReaderView extends ItemView {
 		this.pane.abortActiveStream();
 		this.resizeObserver?.disconnect();
 		this.resizeObserver = null;
+		this.visibilityObserver?.disconnect();
+		this.visibilityObserver = null;
+		this.cancelReleaseTimers();
 		this.statusBarObserver?.disconnect();
 		this.statusBarObserver = null;
 		if (this.resizeTimer !== null) window.clearTimeout(this.resizeTimer);
@@ -2257,6 +2278,8 @@ export class ReaderView extends ItemView {
 	}
 
 	private resetViewState(): void {
+		this.cancelReleaseTimers();
+		this.releaseLevel = 0;
 		this.sections = [];
 		this.units = [];
 		this.sectionIndexById.clear();
@@ -2584,6 +2607,14 @@ export class ReaderView extends ItemView {
 			this.syncJustification(this.measurementContentEl, true);
 		}
 		const spreads = this.getSpreadCountForContent(this.measurementContentEl, innerWidth, gap);
+		// The ink probe below reads where the text actually ends. With breaks
+		// only, a line whose spaces would have shrunk overhangs its column, and
+		// a one-column section read as spilling into the second (changing how
+		// short sections pair). Give the copy its real spacing first — replayed
+		// from the plans just made, and only for the sections the probe runs on.
+		if (spreads <= 1 && this.plugin.settings.readerJustify === "knuth") {
+			this.syncJustification(this.measurementContentEl);
+		}
 		// Column count only gates pairing/singlePage, which test `=== 1`; a
 		// multi-spread section can't be single-column, so skip its ink probe.
 		const columns = spreads > 1 ? 2 : this.getColumnCountForContent(this.measurementContentEl, colWidth);
@@ -2712,7 +2743,22 @@ export class ReaderView extends ItemView {
 		return node;
 	}
 
-	private async mountCurrentUnit(unitIdx: number, spread: number): Promise<void> {
+	/** The newest mount, while it runs. Release waits for it rather than
+	 *  cancelling it: a mount abandoned after it has moved `currentUnitIndex`
+	 *  would leave the position half-changed. */
+	private mountInFlight: Promise<void> | null = null;
+
+	private mountCurrentUnit(unitIdx: number, spread: number): Promise<void> {
+		const run = this.mountCurrentUnitNow(unitIdx, spread);
+		this.mountInFlight = run;
+		const done = (): void => {
+			if (this.mountInFlight === run) this.mountInFlight = null;
+		};
+		run.then(done, done);
+		return run;
+	}
+
+	private async mountCurrentUnitNow(unitIdx: number, spread: number): Promise<void> {
 		if (this.isGlossActive()) this.dismissGloss();
 		const token = ++this.renderToken;
 		this.currentUnitIndex = Math.max(0, Math.min(unitIdx, this.units.length - 1));
@@ -2729,6 +2775,7 @@ export class ReaderView extends ItemView {
 		// hundreds of milliseconds on a unit the size of Psalms — only to redo it.
 		this.applyContentLayout(unit);
 		this.contentNode.appendChild(currentDom);
+		this.releaseLevel = 0;
 		this.syncJustification(this.contentNode);
 		this.preloadLinkPreviewsForUnit(currentDom);
 		this.buildTocAnchorPageMap();
@@ -2741,6 +2788,9 @@ export class ReaderView extends ItemView {
 		this.updateTocActive();
 		this.hasMountedUnit = true;
 		this.schedulePositionSave();
+		// Mounted while off screen (a position restored into a background tab,
+		// a resize in a minimised window): arm the release again.
+		if (!this.isOnScreen()) this.onVisibilityChange();
 	}
 
 	private async mountAdjacentUnits(): Promise<void> {
@@ -2790,6 +2840,7 @@ export class ReaderView extends ItemView {
 			if (!keep.has(key)) {
 				node.remove();
 				this.unitDomCache.delete(key);
+				this.offsetMap.dropUnit(node);
 			}
 		}
 	}
@@ -2952,18 +3003,159 @@ export class ReaderView extends ItemView {
 		if (!root) return;
 		if (this.plugin.settings.readerJustify === "knuth") {
 			const lang = this.book?.language ?? "";
-			const file = this.currentFile;
 			justifyParagraphs(root, {
 				hyphenate: lang === "" || lang.startsWith("en"),
 				// Plans are reused across the measurement pass and every mount of
 				// this book; the mtime retires them if the file is replaced, and
 				// the appearance signature if text settings change.
-				scope: file ? `${file.path}@${file.stat.mtime}|${this.appearanceSignature()}` : undefined,
+				scope: this.justifyScope(),
 				breaksOnly,
 			});
 		} else {
 			clearJustification(root);
 		}
+	}
+
+	/** Cache scope for this book's justification plans: the mtime retires them
+	 *  if the file is replaced, the appearance signature if text settings change. */
+	private justifyScope(): string | undefined {
+		const file = this.currentFile;
+		// The applied signature, not a fresh one: computing it reads styles,
+		// and this runs on every mount.
+		return file ? `${file.path}@${file.stat.mtime}|${this.appliedAppearance || this.appearanceSignature()}` : undefined;
+	}
+
+	// ─── REGION: Off-screen release ──────────────────────────────────────────
+	// A reader nobody can see still held three rendered units (a Psalms-sized
+	// one is ~14k elements), their offset map, link-preview documents, the
+	// search index and every justification plan in the book. While hidden it
+	// keeps only the model, and remounts the current spread when shown.
+
+	private isOnScreen(): boolean {
+		const el = this.contentEl;
+		return el.isConnected && el.ownerDocument.visibilityState === "visible" && el.getClientRects().length > 0;
+	}
+
+	private onVisibilityChange(): void {
+		if (this.isOnScreen()) {
+			this.cancelReleaseTimers();
+			if (this.releaseLevel > 0) void this.restoreResources();
+			return;
+		}
+		if (!this.book || this.releaseLevel === 2 || this.releaseTimer !== null || this.deepReleaseTimer !== null) return;
+		// The position goes to disk now, not when a debounce that may never run
+		// (a backgrounded app is frozen, or killed) gets round to it.
+		this.flushPositionSave();
+		// A backgrounded mobile app can be suspended — timers included — or
+		// killed for memory before any delay elapses, so it lets go at once,
+		// keeping the page it's on for a quick return. A hidden tab waits, in
+		// case this is a quick switch and back.
+		const backgrounded = Platform.isMobile && this.contentEl.ownerDocument.visibilityState === "hidden";
+		if (backgrounded && this.releaseLevel === 0) void this.releaseResources(1);
+		else if (this.releaseLevel === 0) this.rearmRelease(1);
+		this.rearmRelease(2);
+	}
+
+	private rearmRelease(level: 1 | 2): void {
+		if (level === 1) {
+			if (this.releaseTimer !== null) return;
+			this.releaseTimer = window.setTimeout(() => {
+				this.releaseTimer = null;
+				void this.releaseResources(1);
+			}, ReaderView.RELEASE_DELAY_MS);
+		} else {
+			if (this.deepReleaseTimer !== null) return;
+			this.deepReleaseTimer = window.setTimeout(() => {
+				this.deepReleaseTimer = null;
+				void this.releaseResources(2);
+			}, ReaderView.DEEP_RELEASE_DELAY_MS);
+		}
+	}
+
+	private cancelReleaseTimers(): void {
+		if (this.releaseTimer !== null) window.clearTimeout(this.releaseTimer);
+		if (this.deepReleaseTimer !== null) window.clearTimeout(this.deepReleaseTimer);
+		this.releaseTimer = null;
+		this.deepReleaseTimer = null;
+	}
+
+	private flushPositionSave(): void {
+		if (this.positionSaveTimer === null) return;
+		window.clearTimeout(this.positionSaveTimer);
+		this.positionSaveTimer = null;
+		const path = this.currentFile?.path;
+		if (!path) return;
+		this.writeBookPosition(path);
+		void this.plugin.persistSettings();
+	}
+
+	/** Through the layout chain, so it never lands in the middle of a build or
+	 *  a mount; re-checks visibility once its turn comes. */
+	private releaseResources(level: 1 | 2): Promise<void> {
+		return this.runLayoutPass(async () => {
+			if (this.mountInFlight) await this.mountInFlight;
+			const book = this.book;
+			if (!book || this.releaseLevel >= level || this.isOnScreen()) return;
+			// A half-written annotation outlives an app switch: try again later
+			// rather than dismissing the gloss with the draft in it.
+			if (this.isGlossActive()) {
+				this.rearmRelease(level);
+				return;
+			}
+			this.flushPositionSave();
+			const current = this.units[this.currentUnitIndex];
+			const keepKey = level === 1 && current ? this.unitDomKey(current) : "";
+			// Plans for the units shown first on return stay, so the remount
+			// replays them instead of re-running the line breaker.
+			const keepSpines = new Set<number>();
+			for (const u of [this.units[this.currentUnitIndex - 1], current, this.units[this.currentUnitIndex + 1]]) {
+				if (u) for (let s = u.startSpine; s <= u.endSpine; s++) keepSpines.add(s);
+			}
+			// Detaches the current unit too (and the highlight overlays): off the
+			// document its layout is freed even where the leaf itself stays
+			// laid out, as in a minimised window.
+			this.contentNode?.empty();
+			this.prevHost?.empty();
+			this.nextHost?.empty();
+			this.measurementContentEl?.empty();
+			for (const [key, node] of Array.from(this.unitDomCache.entries())) {
+				if (key === keepKey) continue;
+				this.offsetMap.dropUnit(node);
+				this.unitDomCache.delete(key);
+			}
+			if (!keepKey) this.offsetMap.clear();
+			this.mountedUnitKeys.prev = "";
+			this.mountedUnitKeys.next = "";
+			this.clearHighlightOverlay();
+			this.linkPreviewCache.clear();
+			this.linkPreviewPending.clear();
+			this.hoveredLinkPreviewKey = null;
+			clearPreviewCache(book);
+			// An open search is showing hits that came from the index.
+			if (!this.searchOpen) this.searchIndexPromise = null;
+			trimJustifyCaches(this.justifyScope(), keepSpines);
+			this.releaseLevel = level;
+		});
+	}
+
+	private restoreResources(): Promise<void> {
+		return this.runLayoutPass(async () => {
+			if (this.releaseLevel === 0 || !this.isOnScreen()) return;
+			// An un-minimising window or an app-switch animation is still moving:
+			// compare against where it lands, not a frame of the way there.
+			await this.waitForStableGeometry(3, 30, 0);
+			// Re-read after the wait: a mount may have landed meanwhile.
+			if ((this.releaseLevel as number) === 0 || !this.isOnScreen()) return;
+			// Resized while away: the resize pass rebuilds the model at the new
+			// geometry and mounts the position itself; mounting here first would
+			// paginate against the stale model. (With the keyboard up a resize
+			// pass is skipped outright, so mount as things stand.)
+			if (this.getLayoutBucketKey() !== this.measurementBucketKey && !this.softKeyboardUp()) {
+				this.queueResize();
+				return;
+			}
+			await this.mountCurrentUnit(this.currentUnitIndex, this.currentSpread);
+		});
 	}
 
 	/** Append a geometry pass to the serial chain. Passes never overlap — a
@@ -3086,6 +3278,12 @@ export class ReaderView extends ItemView {
 		const oldSectionSpreadOffset = anchor?.offset ?? (this.currentSpread - this.getSpreadOffsetWithinUnit(oldSectionIdx));
 		const oldSectionCount = anchor?.count ?? Math.max(1, this.sectionSpreadCounts[oldSectionIdx] ?? 1);
 		const bucket = this.getLayoutBucketKey();
+		if (bucket === this.measurementBucketKey && this.releaseLevel > 0) {
+			// Released while away, and the geometry came back to where it was:
+			// nothing to rebuild, but the page itself is gone.
+			await this.mountCurrentUnit(this.currentUnitIndex, this.currentSpread);
+			return;
+		}
 		if (bucket === this.measurementBucketKey) {
 			const unit = this.getCurrentUnit();
 			if (unit) this.applyContentLayout(unit);
