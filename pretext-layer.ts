@@ -89,13 +89,19 @@ export class OffsetMap {
 					normalizeLeadingWrapper(el);
 				}
 
-				const prepared = prepareWithSegments(text, font);
-
+				// Prepared lazily: only resolving a selection or a highlight reads
+				// the segments, and a unit holds thousands of paragraphs (a whole
+				// book of Psalms) of which a page shows a handful. Preparing every
+				// one up front was most of the scripting cost of rendering a unit.
+				let prepared: PreparedTextWithSegments | null = null;
 				const entry: ParagraphEntry = {
 					paraId,
 					element: el,
 					text,
-					prepared,
+					get prepared(): PreparedTextWithSegments {
+						if (!prepared) prepared = prepareWithSegments(text, font);
+						return prepared;
+					},
 				};
 
 				// Re-preparing a unit (after cache eviction + re-render) overwrites

@@ -71,24 +71,51 @@ interface RunStyle {
 }
 
 let measureCtx: CanvasRenderingContext2D | null = null;
-const widthCache = new Map<string, number>();
+/** The font last assigned to the context, as given: the context normalises
+ *  what it reports back, and re-parsing a font on every call is the slow part. */
+let measureFont = "";
+/** Widths per font, then per string: a nested lookup avoids building a
+ *  font+text key for every word measured. Bounded per font, generously —
+ *  a long book's vocabulary has to fit, or the cache thrashes mid-book. */
+const widthCache = new Map<string, Map<string, number>>();
+const MAX_WIDTHS_PER_FONT = 200000;
 
 function measure(text: string, style: RunStyle): number {
 	if (!text) return 0;
 	const shown = applyTransform(text, style.transform);
-	const key = `${style.font}\u0000${shown}`;
-	let width = widthCache.get(key);
+	let widths = widthCache.get(style.font);
+	if (!widths) {
+		widths = new Map();
+		widthCache.set(style.font, widths);
+	}
+	let width = widths.get(shown);
 	if (width === undefined) {
 		if (!measureCtx) measureCtx = createEl("canvas").getContext("2d");
 		if (!measureCtx) return 0;
-		measureCtx.font = style.font;
+		if (measureFont !== style.font) {
+			measureCtx.font = style.font;
+			measureFont = style.font;
+		}
 		width = measureCtx.measureText(shown).width;
-		if (widthCache.size > 50000) widthCache.clear();
-		widthCache.set(key, width);
+		if (widths.size >= MAX_WIDTHS_PER_FONT) widths.clear();
+		widths.set(shown, width);
 	}
 	// Letter-spacing lands after every grapheme, so it is added here rather
 	// than through the canvas, keeping the cache font-only.
 	return style.letterSpacing ? width + style.letterSpacing * Array.from(shown).length : width;
+}
+
+/** Hyphenation points per lower-cased word; books repeat their vocabulary. */
+const hyphenCache = new Map<string, string>();
+
+function hyphenateWord(word: string): string {
+	let marked = hyphenCache.get(word);
+	if (marked === undefined) {
+		marked = hyphenateSync(word);
+		if (hyphenCache.size >= 100000) hyphenCache.clear();
+		hyphenCache.set(word, marked);
+	}
+	return marked;
 }
 
 function applyTransform(text: string, transform: string): string {
@@ -258,7 +285,7 @@ function buildWord(pieces: Piece[], opts: JustifyOptions): Word {
 			if (m && m[2].length >= HYPHEN_MIN_WORD && !/\p{Lu}/u.test(m[2].slice(1))) {
 				const core = m[2];
 				const lead = m[1].length;
-				const marked = hyphenateSync(core.toLowerCase());
+				const marked = hyphenateWord(core.toLowerCase());
 				let idx = 0;
 				for (const ch of marked) {
 					if (ch === SOFT_HYPHEN) {
@@ -416,18 +443,66 @@ function optimalBreaks(para: Paragraph, cands: Candidate[], shrinkLimit: number)
 	return breaks.reverse();
 }
 
-// ─── DOM write ───────────────────────────────────────────────────────────────
+// ─── Plans ───────────────────────────────────────────────────────────────────
+//
+// A paragraph's setting is computed once and kept as a plan in textContent
+// offsets, independent of the DOM it was computed on. The same paragraph is
+// set twice per open — on the throwaway measurement copy that sizes each
+// section, then again when its unit mounts — and once per mount after that,
+// at the same width. Replaying a plan skips the walk, the canvas measuring
+// and the line breaker, which were most of the cost of a justified chapter.
 
-type Op =
-	| { kind: "break"; node: Text; offset: number; hyphen: boolean }
-	| { kind: "gap"; node: Text; start: number; end: number; spacing: number };
+interface PlanBreak { at: number; hyphen: boolean }
+interface PlanSpan { start: number; end: number; spacing: number }
+interface Plan { breaks: PlanBreak[]; spans: PlanSpan[] }
 
-function opPos(op: Op): number {
-	return op.kind === "break" ? op.offset : op.start;
+interface CacheEntry { text: string; plan: Plan | null }
+
+/** Paragraph plans per book, keyed by `${spine}:${ordinal}|${geometry key}`.
+ *  The stored text guards the ordinal key against a different render. */
+const planCaches = new Map<string, Map<string, CacheEntry>>();
+const MAX_SCOPES = 3;
+const MAX_PLANS_PER_SCOPE = 60000;
+
+function planCache(scope: string): Map<string, CacheEntry> {
+	let cache = planCaches.get(scope);
+	if (cache) {
+		// Most recently used scope last, so the oldest is evicted first.
+		planCaches.delete(scope);
+		planCaches.set(scope, cache);
+		return cache;
+	}
+	cache = new Map();
+	planCaches.set(scope, cache);
+	while (planCaches.size > MAX_SCOPES) planCaches.delete(planCaches.keys().next().value as string);
+	return cache;
 }
 
-function applyParagraph(para: Paragraph, cands: Candidate[], breaks: number[], nodeOrder: Map<Text, number>): void {
-	const ops: Op[] = [];
+/** Word-separator characters `word-spacing` also stretches, besides the
+ *  collapsible spaces the breaker counts as gaps. A run holding one can't be
+ *  wrapped whole without stretching a space the line widths never budgeted. */
+const OTHER_WORD_SEPARATORS = /[\u00A0\u1361\u{10100}\u{10101}\u{1039F}\u{1091F}]/u;
+
+/** Where a candidate break sits in the DOM: the line before it ends there and
+ *  the next line starts there. */
+function candidatePos(c: Candidate): { node: Text; offset: number } | null {
+	if (c.kind === "space") return { node: c.gap!.node, offset: c.gap!.end };
+	if (c.kind === "hyphen") return { node: c.wordBreak!.node, offset: c.wordBreak!.offset };
+	return null;
+}
+
+function buildPlan(para: Paragraph, cands: Candidate[], breaks: number[]): Plan {
+	// textContent offset of every text node in the paragraph.
+	const nodeStart = new Map<Text, number>();
+	const walker = document.createTreeWalker(para.el, NodeFilter.SHOW_TEXT);
+	let acc = 0;
+	for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+		nodeStart.set(n as Text, acc);
+		acc += (n as Text).length;
+	}
+	const at = (node: Text, offset: number): number => nodeStart.get(node)! + offset;
+
+	const plan: Plan = { breaks: [], spans: [] };
 	let from = 0;
 	for (const to of breaks) {
 		const line = lineStats(para, cands, from, to);
@@ -437,42 +512,117 @@ function applyParagraph(para: Paragraph, cands: Candidate[], breaks: number[], n
 		if (spacing.kind === "justified" && line.gaps > 0) {
 			const extra = (line.maxWidth - line.natural) / line.gaps;
 			const firstGap = a.kind === "space" ? a.word + 1 : a.word;
-			for (let g = firstGap; g < firstGap + line.gaps; g++) {
-				const gap = para.gaps[g];
-				ops.push({ kind: "gap", node: gap.node, start: gap.start, end: gap.end, spacing: gap.baseSpacing + extra });
+			// One span per text node per line rather than one per gap: every
+			// span splits the line into another text fragment, and a justified
+			// chapter of per-gap spans is ~10x the fragments the compositor has
+			// to re-layerize on every page turn. `word-spacing` only touches
+			// spaces, so stretching the words in between changes nothing.
+			const lineStart = candidatePos(a);
+			const lineEnd = candidatePos(b);
+			let g = firstGap;
+			while (g < firstGap + line.gaps) {
+				const node = para.gaps[g].node;
+				let last = g;
+				while (last + 1 < firstGap + line.gaps && para.gaps[last + 1].node === node) last++;
+				const start = lineStart && lineStart.node === node ? lineStart.offset : 0;
+				// The space a line breaks at stays outside: it's dropped at the line
+				// end, and it never had a stretch of its own.
+				const end = lineEnd && lineEnd.node === node
+					? (b.kind === "space" ? b.gap!.start : lineEnd.offset)
+					: node.length;
+				if (start <= para.gaps[g].start && end >= para.gaps[last].end && !OTHER_WORD_SEPARATORS.test(node.data.slice(start, end))) {
+					plan.spans.push({ start: at(node, start), end: at(node, end), spacing: para.gaps[g].baseSpacing + extra });
+				} else {
+					for (let k = g; k <= last; k++) {
+						const gap = para.gaps[k];
+						plan.spans.push({ start: at(gap.node, gap.start), end: at(gap.node, gap.end), spacing: gap.baseSpacing + extra });
+					}
+				}
+				g = last + 1;
 			}
 		}
 		if (b.kind === "space") {
-			ops.push({ kind: "break", node: b.gap!.node, offset: b.gap!.end, hyphen: false });
+			plan.breaks.push({ at: at(b.gap!.node, b.gap!.end), hyphen: false });
 		} else if (b.kind === "hyphen") {
 			const wb = b.wordBreak!;
-			ops.push({ kind: "break", node: wb.node, offset: wb.offset, hyphen: wb.hyphenWidth > 0 });
+			plan.breaks.push({ at: at(wb.node, wb.offset), hyphen: wb.hyphenWidth > 0 });
 		}
 		from = to;
 	}
+	return plan;
+}
 
-	// Back to front, so splitting a text node never invalidates an offset
-	// still waiting to be applied.
-	ops.sort((x, y) => (nodeOrder.get(y.node)! - nodeOrder.get(x.node)!) || (opPos(y) - opPos(x)));
+// ─── DOM write ───────────────────────────────────────────────────────────────
+
+type Op =
+	| { kind: "break"; at: number; hyphen: boolean }
+	| { kind: "gap"; start: number; end: number; spacing: number };
+
+/** Write a plan into the paragraph. `breaksOnly` sets just the line breaks —
+ *  all the measurement pass needs, since spacing never changes a line count. */
+function applyPlan(el: HTMLElement, plan: Plan, breaksOnly: boolean): void {
+	const nodes: Text[] = [];
+	const starts: number[] = [];
+	const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+	let acc = 0;
+	for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+		nodes.push(n as Text);
+		starts.push(acc);
+		acc += (n as Text).length;
+	}
+	if (!nodes.length) return;
+
+	// Spans split per text node, in case this render's nodes fall differently
+	// from the one the plan was made on.
+	const ops: Array<Op & { node: number }> = [];
+	for (const b of plan.breaks) {
+		// A break belongs to the node it ends: the first whose end reaches it.
+		let i = 0;
+		while (i < nodes.length - 1 && starts[i] + nodes[i].length < b.at) i++;
+		ops.push({ kind: "break", at: b.at, hyphen: b.hyphen, node: i });
+	}
+	if (!breaksOnly) {
+		for (const s of plan.spans) {
+			for (let i = 0; i < nodes.length; i++) {
+				const ns = starts[i];
+				const ne = ns + nodes[i].length;
+				const lo = Math.max(s.start, ns);
+				const hi = Math.min(s.end, ne);
+				if (hi > lo) ops.push({ kind: "gap", start: lo, end: hi, spacing: s.spacing, node: i });
+			}
+		}
+	}
+
+	// Back to front, so a split only ever shortens the original node from the
+	// end and every offset still waiting stays valid. A line's span can start
+	// exactly where the previous line's break sits; it goes first, or the
+	// break's split would leave it pointing past the end of its node.
+	const pos = (op: Op): number => (op.kind === "break" ? op.at : op.start);
+	ops.sort((x, y) => (y.node - x.node) || (pos(y) - pos(x)) || ((x.kind === "gap" ? 0 : 1) - (y.kind === "gap" ? 0 : 1)));
 	for (const op of ops) {
+		const node = nodes[op.node];
+		const base = starts[op.node];
 		if (op.kind === "break") {
+			const offset = op.at - base;
 			const span = createSpan({ cls: op.hyphen ? [BREAK_CLASS, HYPHEN_CLASS] : BREAK_CLASS });
-			if (op.offset >= op.node.length) op.node.after(span);
-			else if (op.offset <= 0) op.node.before(span);
+			if (offset >= node.length) node.after(span);
+			else if (offset <= 0) node.before(span);
 			else {
-				op.node.splitText(op.offset);
-				op.node.after(span);
+				node.splitText(offset);
+				node.after(span);
 			}
 		} else {
-			if (op.end < op.node.length) op.node.splitText(op.end);
-			const mid = op.start > 0 ? op.node.splitText(op.start) : op.node;
+			const start = op.start - base;
+			const end = op.end - base;
+			if (end < node.length) node.splitText(end);
+			const mid = start > 0 ? node.splitText(start) : node;
 			const span = createSpan({ cls: GAP_CLASS });
 			span.style.wordSpacing = `${op.spacing.toFixed(3)}px`;
 			mid.replaceWith(span);
 			span.appendChild(mid);
 		}
 	}
-	para.el.classList.add(KP_PARA_CLASS);
+	el.classList.add(KP_PARA_CLASS);
 }
 
 function resetParagraph(p: HTMLElement): void {
@@ -483,16 +633,55 @@ function resetParagraph(p: HTMLElement): void {
 	delete p.dataset.kpKey;
 }
 
+function computePlan(
+	el: HTMLElement,
+	width: number,
+	indent: number,
+	styles: Map<Element, RunStyle>,
+	opts: JustifyOptions,
+): Plan | null {
+	const para = readParagraph(el, width, indent, styles, opts);
+	if (!para) return null;
+	const cands = buildCandidates(para);
+	let breaks: number[] | null = null;
+	for (const limit of SHRINK_LIMITS) {
+		breaks = optimalBreaks(para, cands, limit);
+		if (breaks) break;
+	}
+	if (!breaks || breaks.length < 2) return null;
+	return buildPlan(para, cands, breaks);
+}
+
 // ─── Entry points ────────────────────────────────────────────────────────────
+
+export interface JustifyRunOptions extends JustifyOptions {
+	/** Plans are cached per scope (the book), so a paragraph set while
+	 *  measuring is replayed, not recomputed, when its unit mounts. */
+	scope?: string;
+	/** Line breaks only, no spacing spans: for DOM that is measured, never
+	 *  shown. Line counts still match the shown copy because `p.tmr-kp` is
+	 *  `white-space: nowrap` — a line whose spaces would have shrunk overhangs
+	 *  the column instead of wrapping. */
+	breaksOnly?: boolean;
+}
 
 /** Justify every eligible paragraph under `root` to its current width. Cheap
  *  to call again: paragraphs already set at the same geometry are skipped.
  *  Reads all geometry before writing anything, so a chapter costs one layout
  *  rather than one per paragraph. */
-export function justifyParagraphs(root: HTMLElement, opts: JustifyOptions): void {
+export function justifyParagraphs(root: HTMLElement, opts: JustifyRunOptions): void {
+	// Nothing under an undisplayed root has a width to set it to (every
+	// paragraph would be skipped), but reading their styles still forces a
+	// style pass over the whole hidden unit — the neighbour caches are exactly
+	// that, on every unit change.
+	if (!root.getClientRects().length) return;
 	const all = Array.from(root.querySelectorAll<HTMLElement>(".tmr-spine-item p"));
-	const jobs: Array<{ el: HTMLElement; width: number; indent: number; key: string }> = [];
+	const jobs: Array<{ el: HTMLElement; width: number; indent: number; key: string; cacheKey: string }> = [];
+	const ordinals = new Map<Element, number>();
 	for (const el of all) {
+		const item = el.closest<HTMLElement>(".tmr-spine-item");
+		const ordinal = ordinals.get(item!) ?? 0;
+		ordinals.set(item!, ordinal + 1);
 		if (el.classList.contains("tmr-drop-cap")) continue;
 		const cs = getComputedStyle(el);
 		const align = cs.textAlign;
@@ -501,42 +690,43 @@ export function justifyParagraphs(root: HTMLElement, opts: JustifyOptions): void
 		const width = el.clientWidth - px(cs.paddingLeft) - px(cs.paddingRight);
 		if (width <= 0) continue;
 		const indent = cs.textIndent.endsWith("%") ? width * px(cs.textIndent) / 100 : px(cs.textIndent);
-		const key = [
+		const geometry = [
 			width.toFixed(2), indent.toFixed(2),
 			cs.fontStyle, cs.fontWeight, cs.fontSize, cs.fontFamily, cs.letterSpacing, cs.wordSpacing,
 			opts.hyphenate ? "h" : "",
 		].join("|");
+		const key = opts.breaksOnly ? `${geometry}|b` : geometry;
 		if (el.dataset.kpKey === key) continue;
-		jobs.push({ el, width, indent, key });
+		// The structure tag keeps a plan from being replayed onto the same text
+		// with different inline markup: the measurement copy never has its
+		// source drop-cap wrappers flattened, the mounted unit does.
+		const structure = `${el.childElementCount}:${el.firstChild?.nodeName ?? ""}`;
+		jobs.push({ el, width, indent, key, cacheKey: `${item?.dataset.spineIndex ?? "?"}:${ordinal}|${structure}|${geometry}` });
 	}
 	if (!jobs.length) return;
 
 	for (const job of jobs) if (job.el.classList.contains(KP_PARA_CLASS)) resetParagraph(job.el);
 
+	const cache = opts.scope !== undefined ? planCache(opts.scope) : null;
 	const styles = new Map<Element, RunStyle>();
-	const planned: Array<{ para: Paragraph; cands: Candidate[]; breaks: number[]; key: string }> = [];
+	const planned: Array<{ el: HTMLElement; plan: Plan }> = [];
 	for (const job of jobs) {
 		// Remember the attempt either way, so a paragraph that can't be set
 		// isn't re-walked on every mount at the same width.
 		job.el.dataset.kpKey = job.key;
-		const para = readParagraph(job.el, job.width, job.indent, styles, opts);
-		if (!para) continue;
-		const cands = buildCandidates(para);
-		let breaks: number[] | null = null;
-		for (const limit of SHRINK_LIMITS) {
-			breaks = optimalBreaks(para, cands, limit);
-			if (breaks) break;
+		const text = job.el.textContent ?? "";
+		let entry = cache?.get(job.cacheKey);
+		if (!entry || entry.text !== text) {
+			entry = { text, plan: computePlan(job.el, job.width, job.indent, styles, opts) };
+			if (cache) {
+				if (cache.size >= MAX_PLANS_PER_SCOPE) cache.clear();
+				cache.set(job.cacheKey, entry);
+			}
 		}
-		if (!breaks || breaks.length < 2) continue;
-		planned.push({ para, cands, breaks, key: job.key });
+		if (entry.plan) planned.push({ el: job.el, plan: entry.plan });
 	}
 
-	for (const { para, cands, breaks } of planned) {
-		const nodeOrder = new Map<Text, number>();
-		const walker = document.createTreeWalker(para.el, NodeFilter.SHOW_TEXT);
-		for (let i = 0, n = walker.nextNode(); n; n = walker.nextNode(), i++) nodeOrder.set(n as Text, i);
-		applyParagraph(para, cands, breaks, nodeOrder);
-	}
+	for (const { el, plan } of planned) applyPlan(el, plan, !!opts.breaksOnly);
 }
 
 /** Undo `justifyParagraphs` under `root`, restoring the original text nodes'

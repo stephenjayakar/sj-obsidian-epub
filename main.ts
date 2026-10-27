@@ -651,6 +651,26 @@ interface CapacitorGlobal {
 }
 
 // ─── REGION: ReaderView — Fields ────────────────────────────────────────────
+/** Visible client rects of a set of ranges, each rectangle once. A range's
+ *  client rects include the box of every inline element it fully contains as
+ *  well as that element's text — the same rectangle twice — and overlapping
+ *  translucent highlight rects paint darker. Justified lines wrap their text in
+ *  spacing spans, so without this every justified line drew double-strength. */
+function lineRects(ranges: Range[]): DOMRect[] {
+	const rects: DOMRect[] = [];
+	const seen = new Set<string>();
+	for (const range of ranges) {
+		for (const r of Array.from(range.getClientRects())) {
+			if (!(r.width > 0 && r.height > 0)) continue;
+			const key = `${Math.round(r.left * 2)},${Math.round(r.top * 2)},${Math.round(r.width * 2)},${Math.round(r.height * 2)}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			rects.push(r);
+		}
+	}
+	return rects;
+}
+
 export class ReaderView extends ItemView {
 	private currentFile: TFile | null = null;
 	private popoutGuardEl: HTMLElement | null = null;
@@ -2300,13 +2320,18 @@ export class ReaderView extends ItemView {
 				// the window is occluded) — the view may have been torn down in
 				// the meantime. Building against a dead DOM yields NaN geometry.
 				if (!this.spreadEl?.isConnected) return;
+				// Sections first, and their progress segments with them: an empty
+				// progress bar is 4px shorter than a populated one, so building the
+				// segments after measuring shrank the spread under every measurement
+				// just taken and queued a full second rebuild of the book.
+				this.buildSectionIndex();
+				this.buildProgressSegments();
 				this.layoutMode = this.resolveLayoutMode();
 				this.syncSpreadLayoutMode(this.spreadEl);
 				// Capture the bucket from the same geometry the measurements are
 				// about to use. If geometry shifts mid-build, the queued resize
 				// pass sees a different live bucket and rebuilds cleanly.
 				this.measurementBucketKey = this.getLayoutBucketKey();
-				this.buildSectionIndex();
 				await this.buildRenderUnits();
 				await this.loadSavedHighlights();
 				this.pane.restoreTab();
@@ -2542,16 +2567,21 @@ export class ReaderView extends ItemView {
 		this.measurementSpreadEl.style.width = `${Math.max(200, width)}px`;
 		this.measurementSpreadEl.style.height = `${Math.max(200, height)}px`;
 		this.measurementContentEl.empty();
-		await renderSpineRange(this.book, section.startSpine, section.endSpine, this.measurementContentEl);
-		this.annotateItalicBlocks(this.measurementContentEl);
+		// Size the columns while the copy is still empty (see mountCurrentUnit):
+		// reading the box after rendering lays the whole section out once at a
+		// stale column width before the real measurement.
 		this.syncSpreadLayoutMode(this.measurementSpreadEl);
 		const { innerWidth, colWidth, gap } = this.applyPagination(this.measurementSpreadEl, this.measurementContentEl);
+		await renderSpineRange(this.book, section.startSpine, section.endSpine, this.measurementContentEl);
+		this.annotateItalicBlocks(this.measurementContentEl);
 		if (this.plugin.settings.readerJustify === "knuth") {
 			// Line breaks are computed from canvas metrics, so the faces this
 			// section's first layout just requested have to be in before measuring.
 			void this.measurementContentEl.offsetHeight;
 			await document.fonts.ready;
-			this.syncJustification(this.measurementContentEl);
+			// Breaks only: the copy is measured and discarded, and spacing never
+			// changes how many lines a paragraph takes.
+			this.syncJustification(this.measurementContentEl, true);
 		}
 		const spreads = this.getSpreadCountForContent(this.measurementContentEl, innerWidth, gap);
 		// Column count only gates pairing/singlePage, which test `=== 1`; a
@@ -2693,8 +2723,13 @@ export class ReaderView extends ItemView {
 		if (token !== this.renderToken || !currentDom || !this.contentNode) return;
 
 		this.contentNode.empty();
-		this.contentNode.appendChild(currentDom);
+		// Columns first, against the empty container: pagination only reads the
+		// container's own box, but reading it with the new unit already inside
+		// forces a full multicol layout of that unit at the old column width —
+		// hundreds of milliseconds on a unit the size of Psalms — only to redo it.
 		this.applyContentLayout(unit);
+		this.contentNode.appendChild(currentDom);
+		this.syncJustification(this.contentNode);
 		this.preloadLinkPreviewsForUnit(currentDom);
 		this.buildTocAnchorPageMap();
 		this.currentSpread = Math.max(0, Math.min(spread, unit.spreadCount - 1));
@@ -2913,11 +2948,19 @@ export class ReaderView extends ItemView {
 	 *  Knuth-Plass to their current width, or back to the browser's own breaks
 	 *  (which `.tmr-justify` then stretches in CSS mode).
 	 *  Both directions are no-ops when there is nothing to change. */
-	private syncJustification(root: HTMLElement | null): void {
+	private syncJustification(root: HTMLElement | null, breaksOnly = false): void {
 		if (!root) return;
 		if (this.plugin.settings.readerJustify === "knuth") {
 			const lang = this.book?.language ?? "";
-			justifyParagraphs(root, { hyphenate: lang === "" || lang.startsWith("en") });
+			const file = this.currentFile;
+			justifyParagraphs(root, {
+				hyphenate: lang === "" || lang.startsWith("en"),
+				// Plans are reused across the measurement pass and every mount of
+				// this book; the mtime retires them if the file is replaced, and
+				// the appearance signature if text settings change.
+				scope: file ? `${file.path}@${file.stat.mtime}|${this.appearanceSignature()}` : undefined,
+				breaksOnly,
+			});
 		} else {
 			clearJustification(root);
 		}
@@ -4196,13 +4239,7 @@ export class ReaderView extends ItemView {
 	private rectsForCharRange(paraId: string, start: number, end: number, endParaId?: string): DOMRect[] {
 		const cursorRange = this.offsetMap.charRangeToCursorRange(paraId, start, end, endParaId);
 		if (!cursorRange) return [];
-		const rects: DOMRect[] = [];
-		for (const range of this.offsetMap.cursorsToRanges(cursorRange)) {
-			for (const r of Array.from(range.getClientRects())) {
-				if (r.width > 0 && r.height > 0) rects.push(r);
-			}
-		}
-		return rects;
+		return lineRects(this.offsetMap.cursorsToRanges(cursorRange));
 	}
 
 	private renderSavedHighlights(): void {
@@ -4424,17 +4461,14 @@ export class ReaderView extends ItemView {
 		const overlay = createDiv();
 		overlay.className = "tmr-highlight-overlay";
 		const contentRect = this.contentNode.getBoundingClientRect();
-		for (const range of ranges) {
-			for (const r of Array.from(range.getClientRects())) {
-				if (r.width === 0 || r.height === 0) continue;
-				const rectEl = createDiv();
-				rectEl.className = "tmr-highlight-rect";
-				rectEl.style.left = `${r.left - contentRect.left}px`;
-				rectEl.style.top = `${r.top - contentRect.top}px`;
-				rectEl.style.width = `${r.width}px`;
-				rectEl.style.height = `${r.height}px`;
-				overlay.appendChild(rectEl);
-			}
+		for (const r of lineRects(ranges)) {
+			const rectEl = createDiv();
+			rectEl.className = "tmr-highlight-rect";
+			rectEl.style.left = `${r.left - contentRect.left}px`;
+			rectEl.style.top = `${r.top - contentRect.top}px`;
+			rectEl.style.width = `${r.width}px`;
+			rectEl.style.height = `${r.height}px`;
+			overlay.appendChild(rectEl);
 		}
 		this.contentNode.appendChild(overlay);
 		this.highlightOverlayEl = overlay;
