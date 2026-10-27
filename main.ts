@@ -198,10 +198,19 @@ interface ThirdMindReaderSettings {
 	/** How the neighbouring pages that bleed into the side margins are drawn.
 	 *  Desktop only: touch layouts always clip them. */
 	readerAdjacentPages: "default" | "muted" | "hidden";
-	/** Set body paragraphs justified with Knuth-Plass line breaking and
-	 *  hyphenation (justify.ts) instead of ragged right. */
-	readerJustify: boolean;
+	/** How body paragraphs are set: ragged right, the browser's own
+	 *  `text-align: justify`, or Knuth-Plass line breaking with hyphenation
+	 *  (justify.ts). Stored as a boolean before CSS became a choice. */
+	readerJustify: ReaderJustify;
 }
+
+type ReaderJustify = "off" | "css" | "knuth";
+
+const JUSTIFY_MODES: Record<ReaderJustify, string> = {
+	off: "Off (ragged right)",
+	css: "Browser justify",
+	knuth: "Knuth-Plass",
+};
 
 /** `family: null` is the reader's own default: Labrada in 3C mode, Obsidian's
  *  text font otherwise. */
@@ -272,7 +281,7 @@ const DEFAULT_SETTINGS: ThirdMindReaderSettings = {
 	readerLineWidth: null,
 	readerMargins: null,
 	readerAdjacentPages: "default",
-	readerJustify: false,
+	readerJustify: "off",
 };
 
 /** Bounds of the reader text-size override. Wider than Obsidian's own slider at
@@ -436,6 +445,7 @@ function helpGroups(touch: boolean): { heading: string; rows: HelpRow[] }[] {
 					{ key: "h", desc: "Highlights & Annotations" },
 					{ key: "b", desc: "Create or Remove Bookmark" },
 					{ key: "s", desc: "Search in book" },
+					{ key: "j", desc: "Cycle text justification" },
 					{ key: "Esc", desc: "Close a panel or dismiss the Gloss toolbar" },
 				],
 		},
@@ -672,6 +682,7 @@ export class ReaderView extends ItemView {
 	private appliedAppearance = "";
 
 	private tocOpen = false;
+	private justifyBtnEl: HTMLElement | null = null;
 
 	private resizeObserver: ResizeObserver | null = null;
 	private statusBarObserver: ResizeObserver | null = null;
@@ -1058,7 +1069,7 @@ export class ReaderView extends ItemView {
 			}
 			if (!typing && e.key === "ArrowRight") void this.advance();
 			if (!typing && e.key === "ArrowLeft") void this.retreat();
-			if (!typing && (e.key === "t" || e.key === "h" || e.key === "s" || e.key === "b")
+			if (!typing && (e.key === "t" || e.key === "h" || e.key === "s" || e.key === "b" || e.key === "j")
 				&& !e.ctrlKey && !e.metaKey && !e.altKey) {
 				// preventDefault matters for `s`: the toggle focuses the search
 				// input, and without it this same keystroke's default action
@@ -1067,6 +1078,7 @@ export class ReaderView extends ItemView {
 				if (e.key === "t") this.toggleToc();
 				else if (e.key === "h") this.pane.toggle();
 				else if (e.key === "b") void this.toggleBookmark();
+				else if (e.key === "j") void this.cycleJustify();
 				else this.toggleBookSearch();
 			}
 		});
@@ -1271,7 +1283,8 @@ export class ReaderView extends ItemView {
 		const adjacent = this.plugin.settings.readerAdjacentPages;
 		this.contentEl.toggleClass("tmr-adjacent-muted", adjacent === "muted");
 		this.contentEl.toggleClass("tmr-adjacent-hidden", adjacent === "hidden");
-		this.contentEl.toggleClass("tmr-justify", this.plugin.settings.readerJustify);
+		this.contentEl.toggleClass("tmr-justify", this.plugin.settings.readerJustify !== "off");
+		this.updateJustifyButton();
 		const signature = this.appearanceSignature();
 		if (signature === this.appliedAppearance) return;
 		const first = this.appliedAppearance === "";
@@ -1311,6 +1324,39 @@ export class ReaderView extends ItemView {
 		this.pane.syncTheme();
 		this.updateTocFooter();
 		window.requestAnimationFrame(() => this.renderSavedHighlights());
+	}
+
+	private updateJustifyButton(): void {
+		const btn = this.justifyBtnEl;
+		if (!btn) return;
+		const mode = this.plugin.settings.readerJustify;
+		btn.toggleClass("tmr-toc-footer-btn-active", mode !== "off");
+		btn.ariaLabel = `Justify text: ${JUSTIFY_MODES[mode]}`;
+	}
+
+	private showJustifyMenu(e: MouseEvent): void {
+		const menu = new Menu();
+		for (const [mode, label] of Object.entries(JUSTIFY_MODES) as [ReaderJustify, string][]) {
+			menu.addItem((item) => item
+				.setTitle(label)
+				.setChecked(this.plugin.settings.readerJustify === mode)
+				.onClick(() => void this.setJustify(mode)));
+		}
+		menu.showAtMouseEvent(e);
+	}
+
+	async setJustify(mode: ReaderJustify): Promise<void> {
+		this.plugin.settings.readerJustify = mode;
+		await this.plugin.saveSettings();
+	}
+
+	/** Off → browser → Knuth-Plass → off, for the `j` key and its command, where
+	 *  there is no menu to show which one you landed on. */
+	async cycleJustify(): Promise<void> {
+		const order: ReaderJustify[] = ["off", "css", "knuth"];
+		const next = order[(order.indexOf(this.plugin.settings.readerJustify) + 1) % order.length];
+		await this.setJustify(next);
+		new Notice(`Justify text: ${JUSTIFY_MODES[next]}`);
 	}
 
 	private updateTocFooter(): void {
@@ -1399,6 +1445,12 @@ export class ReaderView extends ItemView {
 		setIcon(helpBtn, "circle-help");
 		helpBtn.ariaLabel = "How to use the reader";
 		this.registerDomEvent(helpBtn, "click", () => new HelpModal(this.app, this.plugin.settings).open());
+		// Left of the 3C button for the same reason help is: it never hides.
+		const justifyBtn = tocFooter.createEl("button", { cls: "tmr-toc-justify-btn" });
+		setIcon(justifyBtn, "align-justify");
+		this.registerDomEvent(justifyBtn, "click", (e) => this.showJustifyMenu(e));
+		this.justifyBtnEl = justifyBtn;
+		this.updateJustifyButton();
 		const modeBtn = tocFooter.createEl("button", { cls: "tmr-toc-mode-btn" });
 		modeBtn.appendChild(sanitizeHTMLToDom(LOGO_3C_SVG));
 		this.registerDomEvent(modeBtn, "click", () => void this.toggleTmrMode());
@@ -2494,7 +2546,7 @@ export class ReaderView extends ItemView {
 		this.annotateItalicBlocks(this.measurementContentEl);
 		this.syncSpreadLayoutMode(this.measurementSpreadEl);
 		const { innerWidth, colWidth, gap } = this.applyPagination(this.measurementSpreadEl, this.measurementContentEl);
-		if (this.plugin.settings.readerJustify) {
+		if (this.plugin.settings.readerJustify === "knuth") {
 			// Line breaks are computed from canvas metrics, so the faces this
 			// section's first layout just requested have to be in before measuring.
 			void this.measurementContentEl.offsetHeight;
@@ -2858,11 +2910,12 @@ export class ReaderView extends ItemView {
 	}
 
 	/** Bring a mounted unit's paragraphs in line with the Justify setting —
-	 *  justified to their current width, or back to the browser's own breaks.
+	 *  Knuth-Plass to their current width, or back to the browser's own breaks
+	 *  (which `.tmr-justify` then stretches in CSS mode).
 	 *  Both directions are no-ops when there is nothing to change. */
 	private syncJustification(root: HTMLElement | null): void {
 		if (!root) return;
-		if (this.plugin.settings.readerJustify) {
+		if (this.plugin.settings.readerJustify === "knuth") {
 			const lang = this.book?.language ?? "";
 			justifyParagraphs(root, { hyphenate: lang === "" || lang.startsWith("en") });
 		} else {
@@ -5509,6 +5562,17 @@ export default class ThirdMindReader extends Plugin {
 			},
 		});
 		this.addCommand({
+			// No default hotkey: `j` cycles it from inside the reader.
+			id: "cycle-justify",
+			name: "Cycle text justification (off / browser / Knuth-Plass)",
+			checkCallback: (checking) => {
+				const v = this.activeReaderView();
+				if (!v) return false;
+				if (!checking) void v.cycleJustify();
+				return true;
+			},
+		});
+		this.addCommand({
 			// Desktop-only by intent, not capability: this is what a phone's
 			// queued exchanges are waiting for, so offering it on the phone would
 			// just re-attempt the calls that were deferred in the first place.
@@ -5674,6 +5738,13 @@ export default class ThirdMindReader extends Plugin {
 		// Lite (matches the "auto-on with provider" rule for new providers).
 		if (data && data.aiFeaturesEnabled === undefined && this.settings.aiProviders.length > 0) {
 			this.settings.aiFeaturesEnabled = true;
+			needsPersist = true;
+		}
+		// Migration: Justify was an on/off switch for Knuth-Plass before the
+		// browser's own justification became a choice beside it.
+		const justify = this.settings.readerJustify as unknown;
+		if (!(typeof justify === "string" && justify in JUSTIFY_MODES)) {
+			this.settings.readerJustify = justify === true ? "knuth" : "off";
 			needsPersist = true;
 		}
 		// Object.assign copies unknown stored keys onto settings, so the migrated
@@ -5940,8 +6011,8 @@ class TmrSettingTab extends PluginSettingTab {
 						}),
 						{
 							name: "Justify text",
-							desc: "Set paragraphs flush to both margins, choosing line breaks across the whole paragraph (Knuth-Plass) and hyphenating English words, for even spacing without rivers.",
-							control: { type: "toggle", key: "readerJustify" },
+							desc: "Set paragraphs flush to both margins. Browser justify is the browser's own line breaking; Knuth-Plass chooses breaks across the whole paragraph and hyphenates English words, for even spacing without rivers. Also in the contents panel footer, or press j while reading.",
+							control: { type: "dropdown", key: "readerJustify", options: JUSTIFY_MODES },
 						},
 					],
 				},
@@ -6189,7 +6260,9 @@ class TmrSettingTab extends PluginSettingTab {
 				settings.readerAdjacentPages = value === "muted" || value === "hidden" ? value : "default";
 				break;
 			case "readerJustify":
-				settings.readerJustify = value === true;
+				settings.readerJustify = typeof value === "string" && value in JUSTIFY_MODES
+					? value as ReaderJustify
+					: "off";
 				break;
 			case "quickHighlight":
 				settings.quickHighlight[Platform.isMobile ? "mobile" : "desktop"] = value === true;

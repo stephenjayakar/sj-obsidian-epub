@@ -2420,6 +2420,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 }
 
 .tmr-toc-help-btn,
+.tmr-toc-justify-btn,
 .tmr-toc-mode-btn,
 .tmr-toc-theme-btn {
 	appearance: none !important;
@@ -2440,6 +2441,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 }
 
 .tmr-toc-help-btn:hover,
+.tmr-toc-justify-btn:hover,
 .tmr-toc-mode-btn:hover,
 .tmr-toc-theme-btn:hover {
 	color: var(--muted-foreground) !important;
@@ -2453,7 +2455,8 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	color: var(--background) !important;            /* Empire-500 #f1eff0 */
 }
 
-.tmr-toc-mode-btn.tmr-toc-footer-btn-active {
+.tmr-toc-mode-btn.tmr-toc-footer-btn-active,
+.tmr-toc-justify-btn.tmr-toc-footer-btn-active {
 	color: var(--primary) !important;
 	border-color: var(--primary) !important;
 	background: var(--hover-popover) !important;
@@ -2475,6 +2478,7 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 }
 
 .tmr-toc-help-btn .svg-icon,
+.tmr-toc-justify-btn .svg-icon,
 .tmr-toc-theme-btn .svg-icon {
 	flex: none;
 	width: 24px;
