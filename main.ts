@@ -57,6 +57,7 @@ import { type LibraryOverride, invalidateMetaCache, configureLibraryPaths, libra
 import {
 	ANCHOR_PREFIX_LEN,
 	AnnotationPreview,
+	HighlightEditor,
 	BOOKMARK_MODE,
 	GLOSS_AI_MODES,
 	GLOSS_MODES,
@@ -719,6 +720,10 @@ export class ReaderView extends ItemView {
 	private tapStart: { x: number; y: number; t: number } | null = null;
 	/** Set at `pointerdown`: iOS has collapsed the selection by the time `click` runs. */
 	private tapDismisses = false;
+	/** Whether the current press began with a selection or the gloss up — the
+	 *  state before the press clears any of it. Such a press is a dismiss, even
+	 *  when it lands on a saved highlight. */
+	private pressDismissesGloss = false;
 	/** The footnote or citation whose floater a first tap has raised, so the next
 	 *  tap on it is understood as "follow it" rather than "show it again". Null
 	 *  whenever no reference floater is up. Touch only. */
@@ -846,6 +851,9 @@ export class ReaderView extends ItemView {
 	/** Shared hover-preview floater for saved highlights. Child component, so
 	 *  its DOM dies with the view; the PDF controller drives its own instance. */
 	private annotationPreview!: AnnotationPreview;
+	/** Opened by a tap or click on an existing highlight: colour, note,
+	 *  conversation, delete. */
+	private highlightEditor!: HighlightEditor;
 	/** Saved-highlight index whose note the open gloss input is editing, or null
 	 *  when the input belongs to a live selection. */
 	private editingNoteIdx: number | null = null;
@@ -934,11 +942,31 @@ export class ReaderView extends ItemView {
 			onInputOpen: () => this.syncScrim(),
 		});
 		this.addChild(this.glossSurface);
-		this.annotationPreview = new AnnotationPreview(
-			() => this.plugin.settings,
-			(idx) => this.beginAddNote(idx),
-		);
+		this.annotationPreview = new AnnotationPreview(() => this.plugin.settings);
 		this.addChild(this.annotationPreview);
+		this.highlightEditor = new HighlightEditor(() => this.plugin.settings, {
+			recolor: async (saved, mode) => {
+				const idx = this.savedHighlights.indexOf(saved);
+				if (idx === -1) return;
+				await this.pane.changeHighlightMode(idx, mode);
+				this.highlightEditor.refresh(this.savedHighlights[idx] === saved ? saved : undefined);
+				this.markEditedHighlight();
+			},
+			editNote: (saved, anchor) => {
+				const idx = this.savedHighlights.indexOf(saved);
+				if (idx !== -1) this.beginAddNote(idx, anchor, true);
+			},
+			remove: (saved) => {
+				const idx = this.savedHighlights.indexOf(saved);
+				if (idx !== -1) void this.pane.deleteHighlightAt(idx, true);
+			},
+			conversation: (saved) => {
+				const idx = this.savedHighlights.indexOf(saved);
+				if (idx === -1 || !this.canOpenConversation(saved)) return null;
+				return () => this.openConversationForHighlight(idx, saved);
+			},
+		});
+		this.addChild(this.highlightEditor);
 		this.pane = new HighlightsPane(this.paneHost());
 		this.addChild(this.pane);
 	}
@@ -1065,7 +1093,8 @@ export class ReaderView extends ItemView {
 		this.escScope = new Scope(this.app.scope);
 		this.escScope.register(null, null, (_evt, ctx) => {
 			if (ctx.key !== "Escape") return;
-			if (this.isGlossActive()) this.dismissGloss();
+			if (this.highlightEditor.isOpen) this.closeHighlightEditor();
+			else if (this.isGlossActive()) this.dismissGloss();
 			else if (this.searchOpen) this.toggleBookSearch(false);
 			else if (this.tocOpen) this.toggleToc();
 			else if (this.pane.isOpen) this.pane.toggle();
@@ -1121,21 +1150,27 @@ export class ReaderView extends ItemView {
 			}
 		});
 
-		// Touch two-step for saved highlights: a tap on a rect raises the preview,
-		// a tap on the preview opens the conversation, anything else puts it away.
-		// Bound on document because the floater lives on document.body, outside
-		// the reader's tree, and document is the last stop in the bubble path.
-		// The `defaultPrevented` guard stops the raise undoing itself — the tap
-		// that raises the preview lands on a paragraph, not on the preview.
+		// A press anywhere outside the highlight editor puts it away. Bound on
+		// document because the editor lives on document.body, outside the
+		// reader's tree; presses inside it stop at the editor. Pointerdown, not
+		// click, so the press that dismisses it has already done so by the time
+		// the root's tap handler decides whether that tap was "only a dismiss".
+		this.registerDomEvent(document, "pointerdown", (e: PointerEvent) => {
+			this.cancelPendingEditorOpen();
+			this.editorClosedByPress = null;
+			if (!this.highlightEditor.isOpen || this.highlightEditor.contains(e.target)) return;
+			// Remembered so a press on the same highlight reads as "close", not
+			// as closing and reopening it.
+			this.editorClosedByPress = this.highlightEditor.current;
+			this.closeHighlightEditor();
+		});
+		// Touch leftovers: the reference preview (footnotes, citations) still
+		// goes away on any tap that didn't raise something.
 		if (Platform.isMobile) {
 			this.registerDomEvent(document, "click", (e: MouseEvent) => {
 				if (e.defaultPrevented) return;
-				if ((e.target as Element | null)?.closest(".tmr-annotation-preview")) {
-					this.openConversationFromPreview();
-				} else {
-					this.hideAnnotationPreview();
-					this.hideTooltip();
-				}
+				this.hideAnnotationPreview();
+				this.hideTooltip();
 			});
 		}
 
@@ -1222,6 +1257,7 @@ export class ReaderView extends ItemView {
 		this.isExtending = false;
 		this.extendAnchor = null;
 		this.annotationPreview.hide();
+		this.closeHighlightEditor();
 		this.clearHighlightOverlay();
 		if (this.progressTooltipRaf !== null) window.cancelAnimationFrame(this.progressTooltipRaf);
 		this.progressTooltipRaf = null;
@@ -1362,6 +1398,7 @@ export class ReaderView extends ItemView {
 		applyGlossTheme(this.extendHintEl, this.plugin.settings);
 		this.glossSurface.syncTheme();
 		this.annotationPreview.syncTheme();
+		this.highlightEditor.syncTheme();
 		this.pane.syncTheme();
 		this.updateTocFooter();
 		window.requestAnimationFrame(() => this.renderSavedHighlights());
@@ -1734,7 +1771,8 @@ export class ReaderView extends ItemView {
 		this.registerDomEvent(root, "pointerdown", (e: PointerEvent) => {
 			this.tapStart = { x: e.clientX, y: e.clientY, t: Date.now() };
 			const sel = window.getSelection();
-			this.tapDismisses = this.glossSurface.barVisible || !!(sel && !sel.isCollapsed);
+			this.tapDismisses = this.glossSurface.barVisible || this.highlightEditor.isOpen || !!(sel && !sel.isCollapsed);
+			this.pressDismissesGloss = this.glossSurface.barVisible || this.isGlossActive() || !!(sel && !sel.isCollapsed);
 		});
 		this.registerDomEvent(root, "click", (e: MouseEvent) => {
 			const start = this.tapStart;
@@ -2783,6 +2821,7 @@ export class ReaderView extends ItemView {
 		this.goToSpread(this.currentSpread);
 		this.renderSavedHighlights();
 		this.hideAnnotationPreview();
+		this.closeHighlightEditor();
 		await this.mountAdjacentUnits();
 		this.updateProgress();
 		this.updateTocActive();
@@ -2935,6 +2974,8 @@ export class ReaderView extends ItemView {
 		const unit = this.getCurrentUnit();
 		if (!this.contentNode || !unit) return;
 		const clamped = Math.max(0, Math.min(n, unit.spreadCount - 1));
+		// Anchored to a highlight that is about to slide away.
+		if (clamped !== this.currentSpread) this.closeHighlightEditor();
 		const stride = this.getNavigationStride();
 		this.currentSpread = clamped;
 		// Far jumps snap instead of sliding. Animating thousands of px in
@@ -3102,6 +3143,7 @@ export class ReaderView extends ItemView {
 				this.rearmRelease(level);
 				return;
 			}
+			this.closeHighlightEditor();
 			this.flushPositionSave();
 			const current = this.units[this.currentUnitIndex];
 			const keepKey = level === 1 && current ? this.unitDomKey(current) : "";
@@ -4168,6 +4210,7 @@ export class ReaderView extends ItemView {
 	/** Parse the companion doc on book load so prior-session highlights are
 	 *  re-rendered in the reader. Missing file = empty list (silent). */
 	private async loadSavedHighlights(): Promise<void> {
+		this.closeHighlightEditor();
 		this.savedHighlights = [];
 		const path = this.getCompanionDocPath();
 		if (!path) return;
@@ -4452,6 +4495,10 @@ export class ReaderView extends ItemView {
 		// method does not (the overlay rides the translateX transform, so it
 		// has nothing to repaint until the unit changes).
 		this.updateBookmarkButton();
+		// A highlight deleted or re-read underneath an open editor shifts the
+		// indices; the editor can't keep pointing at a slot.
+		const editing = this.highlightEditor.current;
+		if (editing && this.savedHighlights[this.highlightEditor.openIdx] !== editing) this.closeHighlightEditor();
 		this.contentNode.querySelectorAll(".tmr-saved-highlight-overlay").forEach((n) => n.remove());
 		if (this.savedHighlights.length === 0) return;
 
@@ -4482,7 +4529,7 @@ export class ReaderView extends ItemView {
 			for (const r of this.savedHighlightRects(saved, resolvedId)) {
 				const rectEl = createDiv();
 				rectEl.className = "tmr-saved-highlight-rect";
-				if (idx === this.pane.activeConversationIdx) {
+				if (idx === this.pane.activeConversationIdx || idx === this.highlightEditor.openIdx) {
 					rectEl.classList.add("tmr-saved-highlight-rect-active");
 				}
 				rectEl.dataset.mode = saved.mode;
@@ -4509,6 +4556,7 @@ export class ReaderView extends ItemView {
 		const hoverEl = e.target instanceof Element ? e.target : null;
 		const overlay = this.contentNode?.querySelector(".tmr-saved-highlight-overlay");
 		if (
+			this.highlightEditor.isOpen ||
 			hoverEl?.closest(".tmr-citation, a[href], [data-rid]") ||
 			!overlay ||
 			this.savedHighlights.length === 0
@@ -4526,50 +4574,103 @@ export class ReaderView extends ItemView {
 		this.annotationPreview.showFor(matchedIdx, saved, e.clientX, e.clientY);
 	}
 
-	/** Hit-test the click against rendered highlight rects. If the pointer
-	 *  lands on a rect for an AI-bearing highlight, open the Conversations
-	 *  tab and expand its card; returns true so the caller can stop other
-	 *  handlers (anchor navigation etc.) from firing. Non-AI highlights and
-	 *  empty hits return false. */
+	/** A click or tap on a saved highlight opens the highlight editor (colour,
+	 *  note, conversation, delete). Returns true when it did, so the caller
+	 *  stops link navigation and the tap zones from also acting on it.
+	 *
+	 *  Never for a press that was really a selection: a drag that ended over a
+	 *  highlight still ends in a click, and so do the presses of a double- or
+	 *  triple-click selecting a word or paragraph. Nor while the gloss bar or
+	 *  input is up — that tap is the one that puts them away. */
 	private handleHighlightClick(e: MouseEvent): boolean {
 		if (!this.contentNode || this.savedHighlights.length === 0) return false;
+		if (e.detail > 1) return false;
+		if (this.pressDismissesGloss) return false;
+		// A held or dragged press is a long-press or a selection gesture, not a
+		// tap — iOS normally swallows the click for those, but not every time.
+		const start = this.tapStart;
+		if (start && (Date.now() - start.t > ReaderView.TAP_MAX_MS
+			|| Math.abs(e.clientX - start.x) > ReaderView.TAP_SLOP_PX
+			|| Math.abs(e.clientY - start.y) > ReaderView.TAP_SLOP_PX)) return false;
+		const sel = window.getSelection();
+		if (sel && !sel.isCollapsed && sel.toString().trim()) return false;
+		if (this.glossSurface.barVisible || this.isGlossActive()) return false;
+		// A link or reference inside a highlight still does its own thing.
+		if ((e.target as Element | null)?.closest(".tmr-citation, a[href], [data-rid]")) return false;
 		const overlay = this.contentNode.querySelector(".tmr-saved-highlight-overlay");
 		if (!overlay) return false;
 
 		const matchedIdx = hitTestHighlightRects(overlay, e.clientX, e.clientY);
 		if (matchedIdx === -1) return false;
-
 		const saved = this.savedHighlights[matchedIdx];
 		if (!saved) return false;
+		// Pressing the highlight whose editor was open: that press closed it.
+		if (saved === this.editorClosedByPress) return true;
 
-		// Touch has no hover, so the preview desktop gets for free needs a tap of
-		// its own — and that tap is the whole interaction here. Opening the
-		// Conversations pane straight from the first tap would hijack the read
-		// every time a thumb landed on an old highlight, so the pane is behind a
-		// second tap *on the preview*. Emphasise highlights, which have no click
-		// behaviour at all on desktop, get the preview too: it's the only way to
-		// read their note on a phone.
-		if (Platform.isMobile) {
-			this.annotationPreview.showFor(matchedIdx, saved, e.clientX, e.clientY);
-			return true;
+		// With a mouse, wait out the double-click interval: the first click of a
+		// double-click selecting a word would otherwise flash the editor up
+		// before the second press closes it. A second press cancels (see the
+		// document pointerdown listener). Touch selects by long-press, not
+		// double-tap, so a tap opens at once.
+		const x = e.clientX, y = e.clientY;
+		this.cancelPendingEditorOpen();
+		if (Platform.isMobile) this.openHighlightEditor(matchedIdx, saved, overlay, x, y);
+		else {
+			this.pendingEditorOpen = window.setTimeout(() => {
+				this.pendingEditorOpen = null;
+				if (this.savedHighlights[matchedIdx] !== saved || this.isGlossActive()) return;
+				this.openHighlightEditor(matchedIdx, saved, overlay, x, y);
+			}, ReaderView.EDITOR_OPEN_DELAY_MS);
 		}
-
-		if (saved.mode === "emphasise" && !saved.userText.trim()) {
-			this.beginAddNote(matchedIdx, new DOMRect(e.clientX, e.clientY, 0, 0));
-			return true;
-		}
-
-		return this.openConversationForHighlight(matchedIdx, saved);
+		return true;
 	}
 
-	/** Second half of the touch two-step: the reader tapped the preview itself.
-	 *  The preview is body-scoped, so this is reached from a document listener
-	 *  rather than the spread's own click handler. */
-	private openConversationFromPreview(): void {
-		const idx = this.annotationPreview.hoveredIdx;
-		const saved = idx === -1 ? null : this.savedHighlights[idx];
+	private pendingEditorOpen: number | null = null;
+	private editorClosedByPress: SavedHighlight | null = null;
+	private static readonly EDITOR_OPEN_DELAY_MS = 250;
+
+	private cancelPendingEditorOpen(): void {
+		if (this.pendingEditorOpen !== null) window.clearTimeout(this.pendingEditorOpen);
+		this.pendingEditorOpen = null;
+	}
+
+	/** Anchor: the highlight's line under the pointer, so the editor sits next
+	 *  to what was tapped rather than off a multi-line highlight's far end. */
+	private openHighlightEditor(idx: number, saved: SavedHighlight, overlay: Element, x: number, y: number): void {
 		this.hideAnnotationPreview();
-		if (saved) this.openConversationForHighlight(idx, saved);
+		let anchor = new DOMRect(x, y, 0, 0);
+		for (const el of Array.from(overlay.querySelectorAll<HTMLElement>(`.tmr-saved-highlight-rect[data-highlight-idx="${idx}"]`))) {
+			const r = el.getBoundingClientRect();
+			if (y >= r.top && y <= r.bottom) {
+				anchor = new DOMRect(Math.min(r.left, x - 1), r.top, Math.max(r.width, 2), r.height);
+				if (x >= r.left && x <= r.right) break;
+			}
+		}
+		this.highlightEditor.open(idx, saved, anchor);
+		this.markEditedHighlight();
+	}
+
+	private closeHighlightEditor(): void {
+		this.cancelPendingEditorOpen();
+		if (!this.highlightEditor.isOpen) return;
+		this.highlightEditor.hide();
+		this.markEditedHighlight();
+	}
+
+	/** Outline the highlight being edited, the way an open conversation's is. */
+	private markEditedHighlight(): void {
+		const overlay = this.contentNode?.querySelector(".tmr-saved-highlight-overlay");
+		if (!overlay) return;
+		const idx = this.highlightEditor.openIdx;
+		for (const el of Array.from(overlay.querySelectorAll<HTMLElement>(".tmr-saved-highlight-rect"))) {
+			const i = parseInt(el.dataset.highlightIdx ?? "-1", 10);
+			el.toggleClass("tmr-saved-highlight-rect-active", i === idx || i === this.pane.activeConversationIdx);
+		}
+	}
+
+	private canOpenConversation(saved: SavedHighlight): boolean {
+		if (!GLOSS_AI_MODES.has(saved.mode)) return false;
+		return !(this.pane.isBareFlagged(saved) && !this.plugin.settings.showBareFlaggedConversations);
 	}
 
 	/** Raise the Conversations tab on a saved highlight, if it has anything to
@@ -4593,17 +4694,18 @@ export class ReaderView extends ItemView {
 		this.annotationPreview.hide();
 	}
 
-	/** Note input for a note-less Emphasise highlight: a desktop click on it, or
-	 *  the touch preview's "+ Add a note". `editingNoteIdx` is what routes the
-	 *  submit to that highlight instead of to a live selection. */
-	private beginAddNote(idx: number, fallback?: DOMRect): void {
-		if (!this.savedHighlights[idx]) return;
+	/** Note input for an Emphasise highlight, opened from the highlight editor
+	 *  (`prefill` carries the existing note in). `editingNoteIdx` is what routes
+	 *  the submit to that highlight instead of to a live selection. */
+	private beginAddNote(idx: number, fallback?: DOMRect, prefill = false): void {
+		const saved = this.savedHighlights[idx];
+		if (!saved) return;
 		// A click can arrive with no preview raised, whose rect then measures zero.
 		const anchor = this.annotationPreview.anchorRect;
 		const rect = anchor.width || !fallback ? anchor : fallback;
 		this.annotationPreview.hide();
 		this.editingNoteIdx = idx;
-		this.glossSurface.openInput("emphasise", rect, true);
+		this.glossSurface.openInput("emphasise", rect, true, prefill ? saved.userText : "");
 	}
 
 	private getCompanionDocPath(): string | null {
@@ -5230,12 +5332,12 @@ export class ReaderView extends ItemView {
 	 *  what a page turn is allowed to sit on top of. */
 	private handleReaderTap(e: MouseEvent): void {
 		if (this.tocOpen || this.pane.isOpen) return;
-		// Book search, the gloss input and a raised annotation preview are all
+		// Book search, the gloss input and a raised reference preview are all
 		// transient layers over the page, and the tap that dismisses one must not
-		// also turn a page underneath it. The preview's own dismissal happens in
-		// the document click handler, one step further up the bubble path.
+		// also turn a page underneath it. (The highlight editor is covered by
+		// `tapDismisses`, captured at pointerdown before it closes.)
 		if (this.searchOpen || this.glossSurface.inputOpen) return;
-		if (this.annotationPreview.hoveredIdx !== -1 || this.referenceTapEl) return;
+		if (this.referenceTapEl) return;
 		const target = e.target as Element | null;
 		if (target?.closest("button, a[href], input, textarea, .tmr-footer, .tmr-toc, .tmr-highlights-panel, .tmr-search-results")) return;
 		// A tap that ends a selection belongs to the gloss grammar — the GlossBar

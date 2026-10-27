@@ -44,7 +44,9 @@ import {
 	applyGlossTheme,
 	existingSourceLink,
 	findCalloutBounds,
+	highlightModeBlocker,
 	rewriteCalloutBody,
+	rewriteCalloutMode,
 	setAiPendingCount,
 	type ConversationTurn,
 	type GlossHostSettings,
@@ -865,6 +867,67 @@ export class HighlightsPane extends Component {
 		}
 		this.host.repaintHighlights();
 		this.renderHighlightsList();
+	}
+
+	/** Switch a highlight to another mode — its colour, and its callout type.
+	 *  See `highlightModeBlocker` for the switches that are refused and why.
+	 *  Returns whether the switch was written. Public for the reader's
+	 *  highlight editor; the pane owns the companion-doc writers. */
+	async changeHighlightMode(idx: number, mode: string): Promise<boolean> {
+		const saved = this.saved[idx];
+		if (!saved || saved.mode === mode) return false;
+		const blocker = highlightModeBlocker(saved, mode);
+		if (blocker) {
+			new Notice(`Can't change colour: ${blocker.toLowerCase()}`);
+			return false;
+		}
+		const path = this.host.companionDocPath();
+		const file = path ? this.app.vault.getFileByPath(path) : null;
+		if (!file) return false;
+
+		const before = { mode: saved.mode, turns: saved.turns, aiState: saved.aiState, aiError: saved.aiError, userText: saved.userText };
+		const toPlainNote = mode === "emphasise";
+		// Emphasise → AI with a note: the note becomes the conversation's first
+		// user turn, written as one. Left as bare note lines, the first message
+		// sent from the chat would rebuild the body from `turns` alone and write
+		// the note away.
+		const noteToTurn = !GLOSS_AI_MODES.has(saved.mode) && GLOSS_AI_MODES.has(mode)
+			&& saved.turns.length === 0 && saved.userText.trim().length > 0;
+		saved.mode = mode;
+		if (toPlainNote) {
+			// What an Emphasise body can hold: the prompt becomes the note.
+			saved.turns = [];
+			saved.aiState = "complete";
+			delete saved.aiError;
+		} else if (noteToTurn) {
+			saved.turns = [{ role: "user", content: saved.userText.trim() }];
+		}
+		const body = toPlainNote
+			? (d: string) => this.rewriteEmphasiseNote(d, saved)
+			: noteToTurn ? (d: string) => rewriteCalloutBody(d, saved) : undefined;
+		let written = false;
+		try {
+			await this.app.vault.process(file, (doc) => {
+				const next = rewriteCalloutMode(doc, saved, body);
+				written = next !== doc;
+				return next;
+			});
+		} catch (err) {
+			console.error("[ThirdMindReader] changeHighlightMode failed", err);
+		}
+		if (!written) {
+			Object.assign(saved, before);
+			if (before.aiError === undefined) delete saved.aiError;
+			new Notice("Third Mind Reader: couldn't change the highlight's colour");
+			return false;
+		}
+		// No `syncAiPendingFlag`: a pending highlight can't change mode, so the
+		// count it keeps is unchanged — and refreshing it rewrites (reformats)
+		// the doc's frontmatter for nothing.
+		this.host.repaintHighlights();
+		this.renderHighlightsList();
+		if (this.paneTab === "conversations") this.renderConversationsList();
+		return true;
 	}
 
 	/** Delete an annotation: excise its callout from the companion doc, drop it

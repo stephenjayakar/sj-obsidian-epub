@@ -16,6 +16,7 @@ import { App, Component, Notice, Platform, TAbstractFile, TFile, View, setIcon, 
 import {
 	ANCHOR_PREFIX_LEN,
 	AnnotationPreview,
+	HighlightEditor,
 	GLOSS_AI_MODES,
 	GlossSurface,
 	type SavedHighlight,
@@ -285,6 +286,8 @@ interface PendingSelection {
 export class PdfGlossController extends Component {
 	private surface: GlossSurface | null = null;
 	private preview: AnnotationPreview | null = null;
+	/** Tap/click on a painted highlight: colour, note, conversation, delete. */
+	private editor: HighlightEditor | null = null;
 	private pane: HighlightsPane | null = null;
 	/** Saved-highlight index whose note the open gloss input is editing, or null
 	 *  when the input belongs to a live selection. */
@@ -363,8 +366,32 @@ export class PdfGlossController extends Component {
 			onDismiss: () => this.dismiss(),
 		});
 		this.addChild(this.surface);
-		this.preview = new AnnotationPreview(this.settings, (idx) => this.beginAddNote(idx));
+		this.preview = new AnnotationPreview(this.settings);
 		this.addChild(this.preview);
+		this.editor = new HighlightEditor(this.settings, {
+			recolor: async (saved, mode) => {
+				const idx = this.saved.indexOf(saved);
+				if (idx === -1) return;
+				await this.pane?.changeHighlightMode(idx, mode);
+				this.editor?.refresh(this.saved[idx] === saved ? saved : undefined);
+			},
+			editNote: (saved, anchor) => {
+				const idx = this.saved.indexOf(saved);
+				if (idx !== -1) this.beginAddNote(idx, anchor, true);
+			},
+			remove: (saved) => {
+				const idx = this.saved.indexOf(saved);
+				if (idx !== -1) void this.pane?.deleteHighlightAt(idx, true);
+			},
+			conversation: (saved) => {
+				const idx = this.saved.indexOf(saved);
+				const pane = this.pane;
+				if (idx === -1 || !pane || !GLOSS_AI_MODES.has(saved.mode)) return null;
+				if (pane.isBareFlagged(saved) && !this.settings().showBareFlaggedConversations) return null;
+				return () => this.openConversationFor(idx, saved);
+			},
+		});
+		this.addChild(this.editor);
 		this.mountPane();
 
 		this.registerDomEvent(this.child.containerEl, "mouseup", () => this.raiseForSelection());
@@ -379,21 +406,27 @@ export class PdfGlossController extends Component {
 		this.registerDomEvent(document, "mousedown", (e: MouseEvent) => this.onDocMouseDown(e));
 		// Touch has no usable mouseup; the bar rises off a settled selection.
 		registerTouchSelectionRaise(this, this.surface, () => this.raiseForSelection());
-		// Second half of the touch two-step: a tap on the preview itself opens the
-		// conversation. The preview is body-scoped, so this can't live on the
-		// container. `defaultPrevented` is what stops the tap that *raised* the
-		// preview from immediately hiding it again — `onClick` marks it handled.
-		if (Platform.isMobile) {
-			this.registerDomEvent(document, "click", (e: MouseEvent) => {
-				const preview = this.preview;
-				if (e.defaultPrevented || !preview) return;
-				const onPreview = (e.target as Element | null)?.closest(".tmr-annotation-preview");
-				const idx = preview.hoveredIdx;
-				const saved = onPreview && idx !== -1 ? this.saved[idx] : null;
-				preview.hide();
-				if (saved) this.openConversationFor(idx, saved);
-			});
-		}
+		// Any press outside the highlight editor puts it away (presses inside
+		// stop at the editor). The editor is body-scoped, so this lives on document.
+		this.registerDomEvent(document, "pointerdown", (e: PointerEvent) => {
+			this.cancelPendingEditorOpen();
+			this.editorClosedByPress = null;
+			if (this.editor?.isOpen && !this.editor.contains(e.target)) {
+				this.editorClosedByPress = this.editor.current;
+				this.editor.hide();
+			}
+		});
+		// The press's starting state, read before anything reacts to it: the
+		// document mousedown below dismisses the gloss bar, and by `click` the
+		// selection has collapsed — so a press that put the bar away would look
+		// like a plain tap on a highlight. Capture phase, on the container.
+		this.registerDomEvent(this.child.containerEl, "pointerdown", (e: PointerEvent) => {
+			const sel = window.getSelection();
+			this.press = {
+				x: e.clientX, y: e.clientY, t: Date.now(),
+				dismisses: !!this.surface?.barVisible || !!this.surface?.inputOpen || !!(sel && !sel.isCollapsed),
+			};
+		}, { capture: true });
 		this.registerDomEvent(document, "keydown", (e: KeyboardEvent) => this.onKeyDown(e));
 		// A fixed-position floater over text that just scrolled away is worse
 		// than no floater. The scroll container is pdf.js's own viewer wrapper.
@@ -402,6 +435,7 @@ export class PdfGlossController extends Component {
 			this.registerDomEvent(scroller, "scroll", () => {
 				this.dismiss();
 				this.preview?.hide();
+				this.editor?.hide();
 			});
 		}
 
@@ -433,6 +467,7 @@ export class PdfGlossController extends Component {
 
 	onunload(): void {
 		this.unloaded = true;
+		this.cancelPendingEditorOpen();
 		// Obsidian nulls `pdfViewer` while tearing the view down, so this runs
 		// against a dead viewer whenever the view closes before the controller.
 		this.child.pdfViewer?.eventBus?.off?.("textlayerrendered", this.onTextLayerRendered);
@@ -512,6 +547,7 @@ export class PdfGlossController extends Component {
 		this.surface?.syncModeState();
 		this.surface?.syncTheme();
 		this.preview?.syncTheme();
+		this.editor?.syncTheme();
 		applyGlossTheme(this.child.containerEl, this.settings());
 		this.repaintAll();
 	}
@@ -677,7 +713,10 @@ export class PdfGlossController extends Component {
 		if (e.key === "Escape") {
 			// One layer per press, in transience order — same ordering the reader
 			// uses, so Escape never skips past the gloss bar to close the pane.
-			if (this.surface.barVisible || this.surface.inputOpen) {
+			if (this.editor?.isOpen) {
+				e.preventDefault();
+				this.editor.hide();
+			} else if (this.surface.barVisible || this.surface.inputOpen) {
 				e.preventDefault();
 				this.dismiss();
 			} else if (this.pane?.isOpen && this.isActiveView()) {
@@ -711,31 +750,63 @@ export class PdfGlossController extends Component {
 		return this.app.workspace.getActiveViewOfType(View) === this.view;
 	}
 
-	/** Hit-test a click against the painted rects. A click on an AI-bearing
-	 *  highlight opens the pane's Conversations tab and expands that card —
-	 *  EPUB parity. Non-AI highlights stay inert. */
+	/** A click or tap on a painted highlight opens the highlight editor — EPUB
+	 *  parity. Never for a press that was really a selection (a drag ending
+	 *  over a highlight, the presses of a double-click), nor while the gloss
+	 *  bar or input is up: that tap is the one that puts them away. */
 	private onClick(e: MouseEvent): void {
-		if (!this.pane || this.saved.length === 0) return;
+		if (!this.pane || !this.editor || this.saved.length === 0) return;
+		if (e.detail > 1) return;
+		const press = this.press;
+		this.press = null;
+		if (press && (press.dismisses || Date.now() - press.t > 600
+			|| Math.abs(e.clientX - press.x) > 12 || Math.abs(e.clientY - press.y) > 12)) return;
+		const sel = window.getSelection();
+		if (sel && !sel.isCollapsed && sel.toString().trim()) return;
+		if (this.surface?.barVisible || this.surface?.inputOpen) return;
 		const idx = hitTestHighlightRects(this.child.containerEl, e.clientX, e.clientY);
 		if (idx === -1) return;
 		const saved = this.saved[idx];
 		if (!saved) return;
-		// Touch has no hover, so the preview needs a tap of its own, and the pane
-		// sits behind a second tap — opening it on the first would hijack the read
-		// every time a thumb landed on an old highlight. Emphasise highlights get
-		// the preview too: on a phone it's the only way to read their note.
-		if (Platform.isMobile) {
-			e.preventDefault();
-			this.preview?.showFor(idx, saved, e.clientX, e.clientY);
-			return;
+		e.preventDefault();
+		this.preview?.hide();
+		// Pressing the highlight whose editor was open: that press closed it.
+		if (saved === this.editorClosedByPress) return;
+		const editor = this.editor;
+		const x = e.clientX, y = e.clientY;
+		// With a mouse, wait out the double-click interval so the first click of
+		// a word-selecting double-click doesn't flash the editor; the second
+		// press cancels. Touch selects by long-press, so a tap opens at once.
+		const open = (): void => {
+			if (this.saved[idx] !== saved || this.surface?.barVisible || this.surface?.inputOpen) return;
+			editor.open(idx, saved, this.editorAnchor(idx, x, y));
+		};
+		this.cancelPendingEditorOpen();
+		if (Platform.isMobile) open();
+		else this.pendingEditorOpen = window.setTimeout(() => { this.pendingEditorOpen = null; open(); }, 250);
+	}
+
+	private pendingEditorOpen: number | null = null;
+	private editorClosedByPress: SavedHighlight | null = null;
+	private press: { x: number; y: number; t: number; dismisses: boolean } | null = null;
+
+	private cancelPendingEditorOpen(): void {
+		if (this.pendingEditorOpen !== null) window.clearTimeout(this.pendingEditorOpen);
+		this.pendingEditorOpen = null;
+	}
+
+	/** The highlight's line under the pointer, so the editor sits next to what
+	 *  was tapped rather than off a multi-line highlight's far end. */
+	private editorAnchor(idx: number, x: number, y: number): DOMRect {
+		let anchor = new DOMRect(x, y, 0, 0);
+		for (const el of Array.from(this.child.containerEl.querySelectorAll<HTMLElement>(`.tmr-saved-highlight-rect[data-highlight-idx="${idx}"]`))) {
+			const r = el.getBoundingClientRect();
+			if (y >= r.top && y <= r.bottom) {
+				anchor = new DOMRect(Math.min(r.left, x - 1), r.top, Math.max(r.width, 2), r.height);
+				if (x >= r.left && x <= r.right) break;
+			}
 		}
-		// The preview's add-note line is only reachable if the pointer crosses the
-		// gap to it before the grace period expires, so the click does the same job.
-		if (saved.mode === "emphasise" && !saved.userText.trim()) {
-			this.beginAddNote(idx, new DOMRect(e.clientX, e.clientY, 0, 0));
-			return;
-		}
-		this.openConversationFor(idx, saved);
+		return anchor;
 	}
 
 	/** Open the pane's Conversations tab on a highlight's card — EPUB parity.
@@ -755,6 +826,10 @@ export class PdfGlossController extends Component {
 	private onMouseMove(e: MouseEvent): void {
 		const preview = this.preview;
 		if (!preview) return;
+		if (this.editor?.isOpen) {
+			if (preview.hoveredIdx !== -1) preview.hide();
+			return;
+		}
 		if (this.saved.length === 0) {
 			if (preview.hoveredIdx !== -1) preview.hide();
 			return;
@@ -774,17 +849,18 @@ export class PdfGlossController extends Component {
 		this.editingNoteIdx = null;
 	}
 
-	/** Note input for a note-less Emphasise highlight: a desktop click on it, or
-	 *  the touch preview's "+ Add a note". `editingNoteIdx` is what routes the
-	 *  submit to that highlight instead of to a live selection. */
-	private beginAddNote(idx: number, fallback?: DOMRect): void {
-		if (!this.saved[idx] || !this.preview) return;
+	/** Note input for an Emphasise highlight, opened from the highlight editor
+	 *  (`prefill` carries the existing note in). `editingNoteIdx` is what routes
+	 *  the submit to that highlight instead of to a live selection. */
+	private beginAddNote(idx: number, fallback?: DOMRect, prefill = false): void {
+		const saved = this.saved[idx];
+		if (!saved || !this.preview) return;
 		// A click can arrive with no preview raised, whose rect then measures zero.
 		const anchor = this.preview.anchorRect;
 		const rect = anchor.width || !fallback ? anchor : fallback;
 		this.preview.hide();
 		this.editingNoteIdx = idx;
-		this.surface?.openInput("emphasise", rect, true);
+		this.surface?.openInput("emphasise", rect, true, prefill ? saved.userText : "");
 	}
 
 	// ── Persistent highlight painting ───────────────────────────────────────
@@ -813,12 +889,17 @@ export class PdfGlossController extends Component {
 		if (this.unloaded) return;
 		this.saved = parsed;
 		this.preview?.hide();
+		this.editor?.hide();
 		this.repaintAll();
 		this.pane?.refreshCompanionDocButton();
 		this.pane?.renderActivePane();
 	}
 
 	private repaintAll(): void {
+		// A highlight deleted or re-read underneath an open editor shifts the
+		// indices; close rather than point at a slot.
+		const editing = this.editor?.current;
+		if (editing && this.saved[this.editor!.openIdx] !== editing) this.editor?.hide();
 		for (const pageEl of this.pageEls()) {
 			const page = parseInt(pageEl.dataset.pageNumber ?? "", 10);
 			if (Number.isFinite(page)) this.paintPage(page);

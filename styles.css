@@ -2644,10 +2644,133 @@ body.theme-light .tmr-root:not([data-tmr-theme]) .tmr-pane-hdr-btn {
 	opacity: 0.8;
 }
 
-/* Only a floater with something to click takes the pointer; every other
-   preview stays transparent so it can't swallow a click meant for the page. */
-.tmr-annotation-preview-actionable {
+
+/* ── Highlight editor ────────────────────────────────────────────────────────
+   Opened by a tap/click on an existing highlight. Borrows the preview's box,
+   theme and mode tokens (it carries `.tmr-annotation-preview`), but it's a
+   control: it takes the pointer, and its buttons are touch-sized. */
+.tmr-highlight-editor {
 	pointer-events: auto;
+	gap: 6px;
+	min-width: 236px;
+	max-width: min(340px, calc(100vw - 24px));
+	padding: 10px 12px;
+}
+
+.tmr-highlight-editor-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+}
+
+.tmr-highlight-editor-swatches {
+	display: flex;
+	gap: 6px;
+}
+
+/* (0,3,1) and the full box spelled out. Obsidian's tablet stylesheet gives
+   every <button> 20px side padding from `.is-tablet button:not(.clickable-icon)`
+   — (0,2,1), since the class inside :not() counts — and 40px of padding in a
+   38px border-box button pushes it out to a 40×38 oblong. Same trap the
+   GlossBar tiles fell into on iPad. */
+.tmr-annotation-preview.tmr-highlight-editor button.tmr-highlight-editor-swatch,
+.tmr-annotation-preview.tmr-highlight-editor button.tmr-highlight-editor-delete {
+	box-sizing: border-box;
+	flex: none;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 30px;
+	height: 30px;
+	min-width: 0;
+	min-height: 0;
+	padding: 0;
+	border: none;
+	border-radius: 9px;
+	box-shadow: none;
+	cursor: pointer;
+	touch-action: manipulation;
+	transition: filter 150ms ease, box-shadow 150ms ease, opacity 150ms ease;
+}
+
+.is-mobile .tmr-annotation-preview.tmr-highlight-editor button.tmr-highlight-editor-swatch,
+.is-mobile .tmr-annotation-preview.tmr-highlight-editor button.tmr-highlight-editor-delete {
+	width: 38px;
+	height: 38px;
+	border-radius: 11px;
+}
+
+.tmr-highlight-editor-swatch .svg-icon,
+.tmr-highlight-editor-delete .svg-icon {
+	flex: none;
+	width: 17px;
+	height: 17px;
+}
+
+.tmr-highlight-editor .tmr-highlight-editor-swatch[data-gloss-mode="emphasise"] { background: color-mix(in srgb, var(--tmr-c-emphasise) 28%, transparent); color: var(--tmr-c-emphasise); --tmr-swatch: var(--tmr-c-emphasise); }
+.tmr-highlight-editor .tmr-highlight-editor-swatch[data-gloss-mode="exclaim"]   { background: color-mix(in srgb, var(--tmr-c-exclaim) 28%, transparent);   color: var(--tmr-c-exclaim-icon); --tmr-swatch: var(--tmr-c-exclaim-icon); }
+.tmr-highlight-editor .tmr-highlight-editor-swatch[data-gloss-mode="explain"]   { background: color-mix(in srgb, var(--tmr-c-explain) 28%, transparent);   color: var(--tmr-c-explain); --tmr-swatch: var(--tmr-c-explain); }
+.tmr-highlight-editor .tmr-highlight-editor-swatch[data-gloss-mode="examine"]   { background: color-mix(in srgb, var(--tmr-c-examine) 28%, transparent);   color: var(--tmr-c-examine); --tmr-swatch: var(--tmr-c-examine); }
+.tmr-highlight-editor .tmr-highlight-editor-swatch[data-gloss-mode="enquiry"]   { background: color-mix(in srgb, var(--tmr-c-enquiry) 28%, transparent);   color: var(--tmr-c-enquiry); --tmr-swatch: var(--tmr-c-enquiry); }
+
+.tmr-highlight-editor .tmr-highlight-editor-swatch.is-active {
+	box-shadow: 0 0 0 2px var(--tmr-swatch);
+}
+
+.tmr-highlight-editor .tmr-highlight-editor-swatch:not(:disabled):not(.is-active):hover {
+	filter: brightness(1.2);
+}
+
+.tmr-highlight-editor .tmr-highlight-editor-swatch:disabled:not(.is-active) {
+	opacity: 0.3;
+	cursor: not-allowed;
+}
+
+.tmr-highlight-editor .tmr-highlight-editor-delete {
+	background: transparent;
+	color: var(--muted-foreground, #8c8787);
+}
+
+.tmr-highlight-editor .tmr-highlight-editor-delete:hover {
+	background: color-mix(in srgb, var(--tmr-c-exclaim-icon) 18%, transparent);
+	color: var(--tmr-c-exclaim-icon);
+}
+
+.tmr-highlight-editor-note {
+	margin: 0 -6px;
+	padding: 4px 6px;
+	border-radius: 6px;
+	cursor: text;
+	transition: background 150ms ease;
+}
+
+.tmr-highlight-editor-note:hover,
+.tmr-highlight-editor-note:focus-visible {
+	background: color-mix(in srgb, currentColor 8%, transparent);
+	outline: none;
+}
+
+.tmr-annotation-preview.tmr-highlight-editor button.tmr-highlight-editor-link {
+	align-self: flex-start;
+	height: auto;
+	min-height: 0;
+	margin: 0 -6px;
+	padding: 4px 6px;
+	border: none;
+	border-radius: 6px;
+	background: transparent;
+	box-shadow: none;
+	color: var(--muted-foreground, #8c8787);
+	font-family: var(--font-primary);
+	font-size: 12px;
+	cursor: pointer;
+	touch-action: manipulation;
+}
+
+.tmr-highlight-editor .tmr-highlight-editor-link:hover {
+	color: var(--tx1, var(--text-normal));
+	background: color-mix(in srgb, currentColor 8%, transparent);
 }
 
 /* ── Gloss callouts (companion doc) ──────────────────────────────────────────

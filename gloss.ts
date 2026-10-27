@@ -569,16 +569,52 @@ function stripFootnotes(content: string): string {
  *  Hosts hit-test their own rects and call {@link showFor}; the index bookkeeping
  *  that keeps the DOM from thrashing as the pointer crosses rects belonging to
  *  the same highlight lives here. */
+/** What a saved highlight's preview shows: the conversation for a finished
+ *  Exclaim/Enquiry, the first answer for Explain, otherwise the reader's own
+ *  note. Clipped to the preview's budget. Shared by the hover preview and the
+ *  highlight editor, so both say the same thing. */
+export function annotationBodyText(saved: SavedHighlight): string {
+	const CHARS = PREVIEW_MAX_CHARS;
+	let body: string;
+	const isComplete = saved.aiState === "complete";
+	if ((saved.mode === "exclaim" || saved.mode === "enquiry") && isComplete && saved.turns.length > 0) {
+		// Conversation view: interleave You/AI turns until the char budget runs out.
+		const parts: string[] = [];
+		let used = 0;
+		for (const turn of saved.turns) {
+			const prefix = turn.role === "user" ? "You: " : "AI: ";
+			const content = stripFootnotes(turn.content);
+			const sep = parts.length > 0 ? 2 : 0; // "\n\n" between turns
+			const available = CHARS - used - sep;
+			if (available <= 15) break;
+			if (prefix.length + content.length <= available) {
+				parts.push(prefix + content);
+				used += sep + prefix.length + content.length;
+			} else {
+				parts.push((prefix + content.slice(0, available - prefix.length)).trimEnd() + "…");
+				break;
+			}
+		}
+		body = parts.join("\n\n");
+	} else if (saved.mode === "explain" && isComplete) {
+		// Explain: show the first AI response only.
+		const first = saved.turns.find((t) => t.role === "assistant");
+		body = first ? stripFootnotes(first.content) : "";
+		if (body.length > CHARS) body = body.slice(0, CHARS).trimEnd() + "…";
+	} else {
+		// Examine, Emphasise, or any mode with a pending/error AI state: show the user's note.
+		body = saved.userText.trim();
+	}
+	return body;
+}
+
 export class AnnotationPreview extends Component {
 	private el: HTMLElement | null = null;
 	private idx = -1;
 
-	/** `onAddNote` backs the touch preview's "+ Add a note" line. On desktop the
-	 *  highlight itself is the click target, so the preview only says so. */
-	constructor(
-		private settings: () => GlossHostSettings,
-		private onAddNote?: (idx: number) => void,
-	) {
+	/** Hover only (pointer devices). Clicking or tapping the highlight opens the
+	 *  HighlightEditor, so the preview just says what's there. */
+	constructor(private settings: () => GlossHostSettings) {
 		super();
 	}
 
@@ -621,13 +657,6 @@ export class AnnotationPreview extends Component {
 	private ensureEl(): HTMLElement {
 		if (this.el) return this.el;
 		this.el = document.body.createDiv({ cls: "tmr-annotation-preview tmr-hidden" });
-		// Delegated, not bound per populate: the floater repopulates on every
-		// hover and a listener per pass would accumulate for the view's life.
-		this.registerDomEvent(this.el, "click", (e) => {
-			if (!(e.target as Element | null)?.closest(".tmr-highlights-item-add-note")) return;
-			e.stopPropagation();
-			this.onAddNote?.(this.idx);
-		});
 		this.syncTheme();
 		return this.el;
 	}
@@ -639,61 +668,22 @@ export class AnnotationPreview extends Component {
 		el.createDiv({ cls: "tmr-annotation-preview-mode",
 			text: saved.mode[0].toUpperCase() + saved.mode.slice(1) });
 
-		const CHARS = PREVIEW_MAX_CHARS;
-		let body: string;
+		const body = annotationBodyText(saved);
 		const isComplete = saved.aiState === "complete";
 
-		if ((saved.mode === "exclaim" || saved.mode === "enquiry") && isComplete && saved.turns.length > 0) {
-			// Conversation view: interleave You/AI turns until the char budget runs out.
-			const parts: string[] = [];
-			let used = 0;
-			for (const turn of saved.turns) {
-				const prefix = turn.role === "user" ? "You: " : "AI: ";
-				const content = stripFootnotes(turn.content);
-				const sep = parts.length > 0 ? 2 : 0; // "\n\n" between turns
-				const available = CHARS - used - sep;
-				if (available <= 15) break;
-				if (prefix.length + content.length <= available) {
-					parts.push(prefix + content);
-					used += sep + prefix.length + content.length;
-				} else {
-					parts.push((prefix + content.slice(0, available - prefix.length)).trimEnd() + "…");
-					break;
-				}
-			}
-			body = parts.join("\n\n");
-		} else if (saved.mode === "explain" && isComplete) {
-			// Explain: show the first AI response only.
-			const first = saved.turns.find((t) => t.role === "assistant");
-			body = first ? stripFootnotes(first.content) : "";
-			if (body.length > CHARS) body = body.slice(0, CHARS).trimEnd() + "…";
-		} else {
-			// Examine, Emphasise, or any mode with a pending/error AI state: show the user's note.
-			body = saved.userText.trim();
-		}
-
-		let actionable = false;
 		if (body.length > 0) {
 			setInlineMarkdown(el.createDiv({ cls: "tmr-annotation-preview-body" }), body);
-		} else if (this.onAddNote && saved.mode === "emphasise" && Platform.isMobile) {
-			// Styled by the Annotations row's own class — same action, same look.
-			el.createDiv({ cls: "tmr-highlights-item-add-note", text: "+ Add a note" });
-			actionable = true;
 		} else {
 			const emptyText = GLOSS_AI_MODES.has(saved.mode) && isComplete
 				? "(no response)"
-				: this.onAddNote && saved.mode === "emphasise"
+				: saved.mode === "emphasise"
 					? "Click to add a note"
-					: "No note yet — add one from the Highlights panel";
+					: "No note yet";
 			el.createDiv({
 				cls: "tmr-annotation-preview-body tmr-annotation-preview-empty",
 				text: emptyText,
 			});
 		}
-		// Pointer-transparent by default so a preview never eats a click meant
-		// for the page; only one with something to click needs to catch it.
-		el.toggleClass("tmr-annotation-preview-actionable", actionable);
-
 		el.removeClass("tmr-hidden");
 	}
 
@@ -709,6 +699,255 @@ export class AnnotationPreview extends Component {
 		if (y + rect.height + margin > safe.bottom) y = clientY - rect.height - 18;
 		el.style.left = `${Math.max(safe.left + margin, x)}px`;
 		el.style.top  = `${Math.max(safe.top + margin, y)}px`;
+	}
+}
+
+// ─── Changing a highlight's mode (its colour) ────────────────────────────────
+
+/** Why a saved highlight can't switch to `mode`, or null when it can.
+ *
+ *  A mode is a colour and a callout type; the body stays as written, which is
+ *  what keeps the switch lossless. An Emphasise note under an AI type reads the
+ *  way a fresh AI callout does before its first exchange (the note is the
+ *  prompt). The one direction that can't be lossless is a highlight that has
+ *  an AI answer becoming Emphasise: Emphasise bodies are a plain note, and the
+ *  next note edit would write the conversation away. */
+export function highlightModeBlocker(saved: SavedHighlight, mode: string): string | null {
+	if (saved.mode === BOOKMARK_MODE.id) return "Bookmarks have no colour";
+	if (!GLOSS_MODES.some((m) => m.id === mode)) return "Unknown colour";
+	if (saved.aiState === "pending") return "Waiting for the AI response";
+	if (mode === "emphasise" && saved.mode !== "emphasise" && saved.turns.some((t) => t.role === "assistant")) {
+		return "Has an AI conversation, which Emphasise can't hold";
+	}
+	return null;
+}
+
+/** Rewrite a callout for `saved` to `mode`: the `> [!type]` token always, and
+ *  for a switch to Emphasise the body too, from the first user turn down to a
+ *  plain note (dropping any `User:` prefix or error marker). Returns the doc
+ *  unchanged when the callout can't be found. `saved` must already carry the
+ *  new mode and note. */
+export function rewriteCalloutMode(doc: string, saved: SavedHighlight, rewriteBody?: (doc: string) => string): string {
+	const lines = doc.split("\n");
+	const bounds = findCalloutBounds(lines, saved);
+	if (!bounds) return doc;
+	const header = lines[bounds.startIdx];
+	const next = header.replace(/^(>\s*\[!)[a-z]+(\])/, `$1${saved.mode}$2`);
+	if (next === header && !rewriteBody) return doc;
+	lines[bounds.startIdx] = next;
+	const out = lines.join("\n");
+	return rewriteBody ? rewriteBody(out) : out;
+}
+
+// ─── Highlight editor ────────────────────────────────────────────────────────
+
+/** Actions take the highlight itself, not its index: the host resolves the
+ *  index at the moment of acting, since the list can be spliced or re-read
+ *  while the editor is open. */
+export interface HighlightEditorActions {
+	/** Switch the highlight to another mode (colour). */
+	recolor(saved: SavedHighlight, mode: string): Promise<void>;
+	/** Open the note input for the highlight, prefilled. Emphasise only. */
+	editNote(saved: SavedHighlight, anchor: DOMRect): void;
+	/** Delete the highlight (the host confirms first). */
+	remove(saved: SavedHighlight): void;
+	/** Open the highlight's conversation, or null when there is none to open. */
+	conversation(saved: SavedHighlight): (() => void) | null;
+}
+
+/** What tapping or clicking an existing highlight opens: its colours, its note
+ *  (or conversation), and delete. Body-scoped like the hover preview and
+ *  styled from it, but pointer-live — it's a control, not a tooltip.
+ *
+ *  The note isn't edited in here. A tap on it hands over to the gloss input
+ *  (prefilled), which already knows how to stay above the iPad keyboard and
+ *  how to commit; a second text field here would have to learn both. */
+export class HighlightEditor extends Component {
+	private el: HTMLElement | null = null;
+	private idx = -1;
+	private saved: SavedHighlight | null = null;
+	private anchor: DOMRect | null = null;
+	private busy = false;
+
+	constructor(
+		private settings: () => GlossHostSettings,
+		private actions: HighlightEditorActions,
+	) {
+		super();
+	}
+
+	onunload(): void {
+		this.el?.remove();
+		this.el = null;
+		this.idx = -1;
+		this.saved = null;
+	}
+
+	get isOpen(): boolean {
+		return this.idx !== -1;
+	}
+
+	get openIdx(): number {
+		return this.idx;
+	}
+
+	/** The highlight open, by identity — an index alone goes stale when the
+	 *  list is spliced or re-read underneath. */
+	get current(): SavedHighlight | null {
+		return this.saved;
+	}
+
+	contains(target: EventTarget | null): boolean {
+		return !!this.el && target instanceof Node && this.el.contains(target);
+	}
+
+	/** Open on highlight `idx`, placed off `anchor` (the highlight's box on
+	 *  screen): below it when there's room, else above. */
+	open(idx: number, saved: SavedHighlight, anchor: DOMRect): void {
+		this.idx = idx;
+		this.saved = saved;
+		this.anchor = anchor;
+		this.render();
+	}
+
+	/** Redraw after the highlight changed underneath (a recolor landed). */
+	refresh(saved: SavedHighlight | undefined): void {
+		if (!this.isOpen) return;
+		if (!saved) { this.hide(); return; }
+		this.saved = saved;
+		this.render();
+	}
+
+	hide(): void {
+		this.idx = -1;
+		this.saved = null;
+		this.el?.addClass("tmr-hidden");
+	}
+
+	syncTheme(): void {
+		applyGlossTheme(this.el, this.settings());
+	}
+
+	private ensureEl(): HTMLElement {
+		if (this.el) return this.el;
+		this.el = document.body.createDiv({ cls: "tmr-annotation-preview tmr-highlight-editor tmr-hidden" });
+		this.el.setAttr("role", "dialog");
+		this.el.setAttr("aria-label", "Edit highlight");
+		// The page's own handlers (tap zones, the touch preview, selection
+		// gestures) must not see a press that lands in here.
+		for (const type of ["pointerdown", "mousedown", "click", "touchstart"] as const) {
+			this.registerDomEvent(this.el, type, (e) => e.stopPropagation());
+		}
+		this.syncTheme();
+		return this.el;
+	}
+
+	private render(): void {
+		const saved = this.saved;
+		if (!saved) return;
+		const idx = this.idx;
+		const el = this.ensureEl();
+		el.empty();
+		el.dataset.glossMode = saved.mode;
+
+		const top = el.createDiv({ cls: "tmr-highlight-editor-row" });
+		const swatches = top.createDiv({ cls: "tmr-highlight-editor-swatches" });
+		for (const mode of GLOSS_MODES) {
+			const blocker = mode.id === saved.mode ? null : highlightModeBlocker(saved, mode.id);
+			const btn = swatches.createEl("button", { cls: "tmr-highlight-editor-swatch" });
+			btn.dataset.glossMode = mode.id;
+			btn.setAttr("aria-label", blocker ? `${mode.label} — ${blocker}` : mode.label);
+			btn.setAttr("title", blocker ? `${mode.label} — ${blocker}` : mode.label);
+			setIcon(btn, mode.icon);
+			if (mode.id === saved.mode) {
+				btn.addClass("is-active");
+				btn.setAttr("aria-pressed", "true");
+			}
+			if (blocker || this.busy) btn.disabled = true;
+			btn.addEventListener("click", () => {
+				if (mode.id === saved.mode || blocker || this.busy) return;
+				this.busy = true;
+				this.render();
+				void this.actions.recolor(saved, mode.id).finally(() => {
+					this.busy = false;
+					if (this.idx === idx) this.render();
+				});
+			});
+		}
+		const del = top.createEl("button", { cls: "tmr-highlight-editor-delete" });
+		del.setAttr("aria-label", "Delete highlight");
+		del.setAttr("title", "Delete highlight");
+		setIcon(del, "trash-2");
+		del.addEventListener("click", () => {
+			this.hide();
+			this.actions.remove(saved);
+		});
+
+		const label = ANNOTATION_MODES.find((m) => m.id === saved.mode)?.label ?? saved.mode;
+		el.createDiv({ cls: "tmr-annotation-preview-mode", text: label });
+
+		const body = annotationBodyText(saved);
+		if (saved.mode === "emphasise") {
+			// The reader's own note: tap to edit, or to add one.
+			const note = el.createDiv({
+				cls: body ? "tmr-annotation-preview-body tmr-highlight-editor-note" : "tmr-highlights-item-add-note tmr-highlight-editor-note",
+			});
+			if (body) setInlineMarkdown(note, body);
+			else note.setText("+ Add a note");
+			note.setAttr("role", "button");
+			note.setAttr("tabindex", "0");
+			note.setAttr("aria-label", body ? "Edit note" : "Add a note");
+			const edit = (): void => {
+				const at = this.anchorRect;
+				this.hide();
+				this.actions.editNote(saved, at);
+			};
+			note.addEventListener("click", edit);
+			note.addEventListener("keydown", (e) => {
+				if (e.key === "Enter" || e.key === " ") { e.preventDefault(); edit(); }
+			});
+		} else if (body) {
+			setInlineMarkdown(el.createDiv({ cls: "tmr-annotation-preview-body" }), body);
+		} else {
+			el.createDiv({
+				cls: "tmr-annotation-preview-body tmr-annotation-preview-empty",
+				text: saved.aiState === "pending" ? "Waiting for the AI response…" : "No note",
+			});
+		}
+
+		const openConversation = this.actions.conversation(saved);
+		if (openConversation) {
+			const link = el.createEl("button", { cls: "tmr-highlight-editor-link", text: "Open conversation →" });
+			link.addEventListener("click", () => {
+				this.hide();
+				openConversation();
+			});
+		}
+
+		el.removeClass("tmr-hidden");
+		this.position();
+	}
+
+	/** Screen box of the editor, for anchoring the note input where it stood. */
+	private get anchorRect(): DOMRect {
+		return this.el?.getBoundingClientRect() ?? this.anchor ?? new DOMRect();
+	}
+
+	private position(): void {
+		const el = this.el;
+		const a = this.anchor;
+		if (!el || !a) return;
+		const box = el.getBoundingClientRect();
+		const safe = getSafeViewport();
+		const margin = 12;
+		const gap = 8;
+		let y = a.bottom + gap;
+		if (y + box.height + margin > safe.bottom) y = a.top - box.height - gap;
+		y = Math.max(safe.top + margin, Math.min(y, safe.bottom - box.height - margin));
+		let x = a.left + a.width / 2 - box.width / 2;
+		x = Math.max(safe.left + margin, Math.min(x, safe.right - box.width - margin));
+		el.style.left = `${x}px`;
+		el.style.top = `${y}px`;
 	}
 }
 
@@ -1107,7 +1346,9 @@ export class GlossSurface extends Component {
 	/** `standalone` opens the panel with no GlossBar behind it, for a host that
 	 *  already knows what the text will be written to — editing a saved
 	 *  annotation, or a Lite-mode selection under `quickHighlightOn`. */
-	openInput(modeId: string, selectionRect: DOMRect, standalone = false): void {
+	/** `initial` prefills the field — editing an existing note rather than
+	 *  writing a new one. */
+	openInput(modeId: string, selectionRect: DOMRect, standalone = false, initial = ""): void {
 		// The raised bar *is* the "there is a live selection" signal — without it
 		// the host has nothing to anchor a submit to, and the input would collect
 		// text that silently goes nowhere.
@@ -1122,7 +1363,7 @@ export class GlossSurface extends Component {
 		panel.dataset.glossMode = modeId;
 		const input = panel.querySelector<HTMLInputElement>(".tmr-gloss-input-field");
 		if (input) {
-			input.value = "";
+			input.value = initial;
 			input.placeholder = GLOSS_PLACEHOLDERS[modeId] ?? "";
 		}
 		panel.removeClass("tmr-hidden");
