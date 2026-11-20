@@ -479,9 +479,22 @@ function findParentParagraph(node: Node): HTMLElement | null {
 	return null;
 }
 
-/** Compute the character offset from the start of a paragraph to a position
- *  within one of its descendant text nodes. */
+/** Compute the character offset from the start of a paragraph to a DOM
+ *  boundary `(node, offset)` within it — handling both text nodes and
+ *  element-node boundaries (which iOS WebKit produces at inline tags and
+ *  paragraph edges). */
 function getCharOffsetInParagraph(paragraph: HTMLElement, node: Node, offset: number): number {
+	if (node.nodeType !== Node.TEXT_NODE) {
+		if (node !== paragraph && !paragraph.contains(node)) return -1;
+		try {
+			const r = document.createRange();
+			r.setStart(paragraph, 0);
+			r.setEnd(node, offset);
+			return r.toString().length;
+		} catch {
+			return -1;
+		}
+	}
 	const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT);
 	let charCount = 0;
 	let current: Text | null;

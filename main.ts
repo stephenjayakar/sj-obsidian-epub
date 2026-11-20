@@ -213,6 +213,14 @@ const JUSTIFY_MODES: Record<ReaderJustify, string> = {
 	knuth: "Knuth-Plass",
 };
 
+/** Effective justification on this device: Knuth-Plass rewrites paragraphs with
+ *  nowrap + ::before breaks and span wrappers that interfere with iOS touch
+ *  selection, so mobile falls back to CSS justification while leaving the
+ *  synced setting intact for desktop. */
+function effectiveJustify(mode: ReaderJustify): ReaderJustify {
+	return Platform.isMobile && mode === "knuth" ? "css" : mode;
+}
+
 /** `family: null` is the reader's own default: Labrada in 3C mode, Obsidian's
  *  text font otherwise. */
 const READER_FONTS = {
@@ -1375,7 +1383,7 @@ export class ReaderView extends ItemView {
 		const adjacent = this.plugin.settings.readerAdjacentPages;
 		this.contentEl.toggleClass("tmr-adjacent-muted", adjacent === "muted");
 		this.contentEl.toggleClass("tmr-adjacent-hidden", adjacent === "hidden");
-		this.contentEl.toggleClass("tmr-justify", this.plugin.settings.readerJustify !== "off");
+		this.contentEl.toggleClass("tmr-justify", effectiveJustify(this.plugin.settings.readerJustify) !== "off");
 		this.updateJustifyButton();
 		const signature = this.appearanceSignature();
 		if (signature === this.appliedAppearance) return;
@@ -1398,7 +1406,7 @@ export class ReaderView extends ItemView {
 			s.readerParagraphSpacing,
 			s.readerLineWidth,
 			s.readerMargins,
-			s.readerJustify,
+			effectiveJustify(s.readerJustify),
 		].join("|");
 	}
 
@@ -1422,17 +1430,19 @@ export class ReaderView extends ItemView {
 	private updateJustifyButton(): void {
 		const btn = this.justifyBtnEl;
 		if (!btn) return;
-		const mode = this.plugin.settings.readerJustify;
+		const mode = effectiveJustify(this.plugin.settings.readerJustify);
 		btn.toggleClass("tmr-toc-footer-btn-active", mode !== "off");
 		btn.ariaLabel = `Justify text: ${JUSTIFY_MODES[mode]}`;
 	}
 
 	private showJustifyMenu(e: MouseEvent): void {
 		const menu = new Menu();
+		const current = effectiveJustify(this.plugin.settings.readerJustify);
 		for (const [mode, label] of Object.entries(JUSTIFY_MODES) as [ReaderJustify, string][]) {
+			if (Platform.isMobile && mode === "knuth") continue;
 			menu.addItem((item) => item
 				.setTitle(label)
-				.setChecked(this.plugin.settings.readerJustify === mode)
+				.setChecked(current === mode)
 				.onClick(() => void this.setJustify(mode)));
 		}
 		menu.showAtMouseEvent(e);
@@ -1443,11 +1453,13 @@ export class ReaderView extends ItemView {
 		await this.plugin.saveSettings();
 	}
 
-	/** Off → browser → Knuth-Plass → off, for the `j` key and its command, where
-	 *  there is no menu to show which one you landed on. */
+	/** Off → browser → Knuth-Plass → off (desktop), or off ↔ browser (mobile),
+	 *  for the `j` key and its command, where there is no menu to show which
+	 *  one you landed on. */
 	async cycleJustify(): Promise<void> {
-		const order: ReaderJustify[] = ["off", "css", "knuth"];
-		const next = order[(order.indexOf(this.plugin.settings.readerJustify) + 1) % order.length];
+		const order: ReaderJustify[] = Platform.isMobile ? ["off", "css"] : ["off", "css", "knuth"];
+		const current = effectiveJustify(this.plugin.settings.readerJustify);
+		const next = order[(order.indexOf(current) + 1) % order.length];
 		await this.setJustify(next);
 		new Notice(`Justify text: ${JUSTIFY_MODES[next]}`);
 	}
@@ -2662,7 +2674,7 @@ export class ReaderView extends ItemView {
 		const { innerWidth, colWidth, gap } = this.applyPagination(this.measurementSpreadEl, this.measurementContentEl);
 		await renderSpineRange(this.book, section.startSpine, section.endSpine, this.measurementContentEl);
 		this.annotateItalicBlocks(this.measurementContentEl);
-		if (this.plugin.settings.readerJustify === "knuth") {
+		if (effectiveJustify(this.plugin.settings.readerJustify) === "knuth") {
 			// Line breaks are computed from canvas metrics, so the faces this
 			// section's first layout just requested have to be in before measuring.
 			void this.measurementContentEl.offsetHeight;
@@ -2677,7 +2689,7 @@ export class ReaderView extends ItemView {
 		// a one-column section read as spilling into the second (changing how
 		// short sections pair). Give the copy its real spacing first — replayed
 		// from the plans just made, and only for the sections the probe runs on.
-		if (spreads <= 1 && this.plugin.settings.readerJustify === "knuth") {
+		if (spreads <= 1 && effectiveJustify(this.plugin.settings.readerJustify) === "knuth") {
 			this.syncJustification(this.measurementContentEl);
 		}
 		// Column count only gates pairing/singlePage, which test `=== 1`; a
@@ -3067,7 +3079,7 @@ export class ReaderView extends ItemView {
 	 *  Both directions are no-ops when there is nothing to change. */
 	private syncJustification(root: HTMLElement | null, breaksOnly = false): void {
 		if (!root) return;
-		if (this.plugin.settings.readerJustify === "knuth") {
+		if (effectiveJustify(this.plugin.settings.readerJustify) === "knuth") {
 			const lang = this.book?.language ?? "";
 			justifyParagraphs(root, {
 				hyphenate: lang === "" || lang.startsWith("en"),
@@ -6474,7 +6486,7 @@ class TmrSettingTab extends PluginSettingTab {
 						}),
 						{
 							name: "Justify text",
-							desc: "Set paragraphs flush to both margins. Browser justify is the browser's own line breaking; Knuth-Plass chooses breaks across the whole paragraph and hyphenates English words, for even spacing without rivers. Also in the contents panel footer, or press j while reading.",
+							desc: "Set paragraphs flush to both margins. Browser justify is the browser's own line breaking; Knuth-Plass chooses breaks across the whole paragraph and hyphenates English words, for even spacing without rivers (desktop only — falls back to browser justify on mobile). Also in the contents panel footer, or press j while reading.",
 							control: { type: "dropdown", key: "readerJustify", options: JUSTIFY_MODES },
 						},
 					],

@@ -1377,6 +1377,10 @@ export class GlossSurface extends Component {
 			// behind, which would outrank the stylesheet and fight `bottom`.
 			panel.style.removeProperty("top");
 			this.trackKeyboard();
+			// Drop the native page selection before focusing the field so iOS
+			// dismisses its selection handles/callout and hands focus + keyboard
+			// straight to the input (our overlay keeps the passage highlighted).
+			window.getSelection()?.removeAllRanges();
 		} else {
 			this.positionFloater(panel, selectionRect);
 		}
@@ -1661,10 +1665,17 @@ export function registerTouchSelectionRaise(
 	owner.registerDomEvent(document, "selectionchange", () => {
 		// The input owns the selection once it's open — re-raising here would
 		// close it out from under a half-typed annotation.
-		if (surface.inputOpen) return;
+		if (surface.inputOpen) {
+			if (timer !== null) {
+				window.clearTimeout(timer);
+				timer = null;
+			}
+			return;
+		}
 		if (timer !== null) window.clearTimeout(timer);
 		timer = window.setTimeout(() => {
 			timer = null;
+			if (surface.inputOpen) return;
 			raise();
 		}, SELECTION_SETTLE_MS);
 	});
