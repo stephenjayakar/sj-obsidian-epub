@@ -847,6 +847,12 @@ export class ReaderView extends ItemView {
 	private isExtending = false;
 	private extendAnchor: { node: Node; offset: number } | null = null;
 	private extendHintEl: HTMLElement | null = null;
+	/** Drag-select page turning (desktop). True from a left-button press in the
+	 *  content until its release; while it holds, a pointer parked in a side
+	 *  margin turns the page under the selection — see `onSelectionDragMove`. */
+	private dragSelecting = false;
+	private dragTurnDir: -1 | 0 | 1 = 0;
+	private dragTurnTimer: number | null = null;
 	private savedHighlights: SavedHighlight[] = [];
 	/** Shared hover-preview floater for saved highlights. Child component, so
 	 *  its DOM dies with the view; the PDF controller drives its own instance. */
@@ -902,6 +908,14 @@ export class ReaderView extends ItemView {
 	 *  Held open for as long as a pane or the search bar is up — see
 	 *  `syncChromeHold`. */
 	private static readonly CHROME_AUTOHIDE_MS = 6000;
+	/** How long a selection drag must rest in a side margin before the page
+	 *  turns, and then how often it keeps turning while it stays there. Long
+	 *  enough that sweeping past the edge on the way somewhere doesn't flip. */
+	private static readonly DRAG_TURN_DWELL_MS = 450;
+	private static readonly DRAG_TURN_REPEAT_MS = 900;
+	/** Floor on the margin zone's width, for narrow panes whose side padding
+	 *  shrinks to almost nothing. */
+	private static readonly DRAG_TURN_MIN_ZONE_PX = 24;
 	/** Mirrors `--tmr-chrome-delay` and the two `--tmr-chrome-move` values in
 	 *  styles.css, which own the phone progress bar's reveal. Summon and dismiss
 	 *  run at different lengths on purpose — see the note on the tokens.
@@ -1256,6 +1270,7 @@ export class ReaderView extends ItemView {
 		this.extendHintEl = null;
 		this.isExtending = false;
 		this.extendAnchor = null;
+		this.endSelectionDrag();
 		this.annotationPreview.hide();
 		this.closeHighlightEditor();
 		this.clearHighlightOverlay();
@@ -1753,6 +1768,18 @@ export class ReaderView extends ItemView {
 			else void this.retreat();
 		});
 		this.registerDomEvent(this.spreadEl, "mouseup", () => this.raiseGlossForSelection());
+
+		// Drag a selection into the side margin — where the neighbouring page
+		// already peeks in — and the page turns under it, so a highlight can run
+		// across a page break without the Extend tile. Mouse only: touch selection
+		// is driven by native handles that never report their drag to us.
+		if (!Platform.isMobile) {
+			this.registerDomEvent(this.contentNode, "mousedown", (e: MouseEvent) => {
+				if (e.button === 0) this.dragSelecting = true;
+			});
+			this.registerDomEvent(document, "mousemove", (e: MouseEvent) => this.onSelectionDragMove(e));
+			this.registerDomEvent(document, "mouseup", () => this.endSelectionDrag());
+		}
 
 		// Touch page-turn zones (Phase C). Two full-height strips at the left and
 		// right edges turn pages; everything between them toggles the chrome.
@@ -2921,9 +2948,7 @@ export class ReaderView extends ItemView {
 	async advance(): Promise<void> {
 		const unit = this.getCurrentUnit();
 		if (!unit) return;
-		// While extending, keep the selection alive across the turn so the far
-		// endpoint can be set on a later spread.
-		if (this.isGlossActive() && !this.isExtending) this.dismissGloss();
+		this.closeGlossForTurn(this.currentSpread < unit.spreadCount - 1);
 		if (this.currentSpread < unit.spreadCount - 1) {
 			this.goToSpread(this.currentSpread + 1);
 			this.registerReadingTurn();
@@ -2936,7 +2961,7 @@ export class ReaderView extends ItemView {
 	}
 
 	async retreat(): Promise<void> {
-		if (this.isGlossActive() && !this.isExtending) this.dismissGloss();
+		this.closeGlossForTurn(this.currentSpread > 0);
 		if (this.currentSpread > 0) {
 			this.goToSpread(this.currentSpread - 1);
 			this.registerReadingTurn();
@@ -3946,7 +3971,111 @@ export class ReaderView extends ItemView {
 		if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
 		const range = sel.getRangeAt(0);
 		if (!this.spreadEl || !this.spreadEl.contains(range.startContainer)) return;
-		this.finalizeSelection(sel, range.getBoundingClientRect());
+		this.finalizeSelection(sel, this.visibleRangeRect(range));
+	}
+
+	/** The on-screen part of a range, for anchoring the bar. A selection carried
+	 *  across a page break by drag or shift-click starts on an earlier spread,
+	 *  and its whole bounding rect reaches off-screen onto that page. */
+	private visibleRangeRect(range: Range): DOMRect {
+		const box = this.readingBox();
+		if (!box) return range.getBoundingClientRect();
+		let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
+		for (const r of Array.from(range.getClientRects())) {
+			if (!r.width || !r.height || r.right <= box.left || r.left >= box.right) continue;
+			left = Math.min(left, r.left);
+			top = Math.min(top, r.top);
+			right = Math.max(right, r.right);
+			bottom = Math.max(bottom, r.bottom);
+		}
+		return left === Infinity ? range.getBoundingClientRect() : new DOMRect(left, top, right - left, bottom - top);
+	}
+
+	/** Left/right edges of the visible reading columns — the spread minus its
+	 *  side padding, where the neighbouring pages bleed in on desktop. */
+	private readingBox(): { left: number; right: number } | null {
+		if (!this.spreadEl) return null;
+		const view = this.spreadEl.getBoundingClientRect();
+		const cs = getComputedStyle(this.spreadEl);
+		return {
+			left: view.left + (parseFloat(cs.paddingLeft) || 0),
+			right: view.right - (parseFloat(cs.paddingRight) || 0),
+		};
+	}
+
+	/** Page turns close the gloss — except a selection still on its bar, turned
+	 *  within the unit on desktop: the bar goes but the native selection stays,
+	 *  so shift-click on the new page carries it across the break (the click
+	 *  never dismisses — see the document mousedown handler). A unit change
+	 *  remounts the DOM, which no selection can survive. */
+	private closeGlossForTurn(withinUnit: boolean): void {
+		// While extending, keep the selection alive across the turn so the far
+		// endpoint can be set on a later spread.
+		if (!this.isGlossActive() || this.isExtending) return;
+		if (withinUnit && !Platform.isMobile && this.glossSurface.barVisible && this.editingNoteIdx === null) {
+			this.glossSurface.hide();
+			this.clearHighlightOverlay();
+			this.activeSelectionText = null;
+			this.activeSelectionRect = null;
+			this.syncScrim();
+			return;
+		}
+		this.dismissGloss();
+	}
+
+	/** Track a selection drag against the side margins: resting in one arms a
+	 *  page turn that way after DRAG_TURN_DWELL_MS, repeating while it stays.
+	 *  The browser keeps extending the selection as the pointer moves over the
+	 *  freshly turned page, so nothing here touches the selection itself. */
+	private onSelectionDragMove(e: MouseEvent): void {
+		if (!this.dragSelecting) return;
+		// A release outside the window never reaches our mouseup.
+		if ((e.buttons & 1) === 0) {
+			this.endSelectionDrag();
+			return;
+		}
+		const dir = this.dragEdgeDirection(e.clientX);
+		if (dir === this.dragTurnDir) return;
+		this.clearDragTurnTimer();
+		this.dragTurnDir = dir;
+		if (dir !== 0) this.scheduleDragTurn(ReaderView.DRAG_TURN_DWELL_MS);
+	}
+
+	private dragEdgeDirection(x: number): -1 | 0 | 1 {
+		const box = this.readingBox();
+		const view = this.spreadEl?.getBoundingClientRect();
+		if (!box || !view) return 0;
+		const min = ReaderView.DRAG_TURN_MIN_ZONE_PX;
+		if (x > Math.min(box.right, view.right - min)) return 1;
+		if (x < Math.max(box.left, view.left + min)) return -1;
+		return 0;
+	}
+
+	/** Turn within the unit only: the neighbouring unit is a separate DOM the
+	 *  selection can't reach, and mounting it would wipe the selection. */
+	private scheduleDragTurn(delay: number): void {
+		this.dragTurnTimer = window.setTimeout(() => {
+			this.dragTurnTimer = null;
+			const unit = this.getCurrentUnit();
+			const sel = window.getSelection();
+			if (!this.dragSelecting || !unit || !sel || sel.isCollapsed) return;
+			const next = this.currentSpread + this.dragTurnDir;
+			if (next < 0 || next >= unit.spreadCount) return;
+			this.goToSpread(next);
+			this.registerReadingTurn();
+			this.scheduleDragTurn(ReaderView.DRAG_TURN_REPEAT_MS);
+		}, delay);
+	}
+
+	private clearDragTurnTimer(): void {
+		if (this.dragTurnTimer !== null) window.clearTimeout(this.dragTurnTimer);
+		this.dragTurnTimer = null;
+	}
+
+	private endSelectionDrag(): void {
+		this.dragSelecting = false;
+		this.dragTurnDir = 0;
+		this.clearDragTurnTimer();
 	}
 
 	/** Resolve a native selection to a stored `CursorRange`, paint the active
